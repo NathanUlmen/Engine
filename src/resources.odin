@@ -2,7 +2,6 @@ package main
 
 import hm "core:container/handle_map"
 import "core:encoding/uuid"
-import "core:fmt"
 import "core:log"
 import "core:mem"
 import "core:os"
@@ -11,6 +10,7 @@ import "core:path/filepath"
 /*
 TBD:
 How/should we make this thing thread safe?
+How should we handle allocation and freeing of resources? How do we enforce everything use the same allocator.
 */
 
 ResourceSystem :: struct {
@@ -131,11 +131,11 @@ rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 */
 rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
 	hm.dynamic_destroy(&rs.handle_map)
-	free_all(rs.allocator) // this also wont work in long run but yolo
 	//TODO: Revist this later. (Maybe add a delete proc to the Serializer ?)
 	for _, serializer in rs.serializers {
 		free(serializer.user_data)
 	}
+	free_all(rs.allocator)
 
 }
 
@@ -263,15 +263,15 @@ handle_batch_acquire_async :: proc(rs: ^ResourceSystem) -> ResourceFuture {
 /*
 
 */
-release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) {
+release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Error {
 	slot, ok := hm.dynamic_get(&rs.handle_map, handle)
 	if !ok {
-		panic("TODO: release_handle")
+		return .Handle_Error
 	}
 
 	slot.checked_out -= 1
 	if slot.checked_out == 0xFFFFFFFF {
-		panic("Invalid Frees have occured!")
+		return .Handle_Error
 	}
 
 	if slot.checked_out == 0 {
@@ -280,6 +280,7 @@ release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) {
 		//TODO: Look into adding another callback instead of just blindly freeing here
 		defer free(slot.data, rs.allocator)
 	}
+	return .None
 }
 
 /*
@@ -304,7 +305,6 @@ handle_resolve :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> (rawptr, Reso
 /*
 Performs a shallow copy of a resource. If the resoruce is part of the registry it will be loaded
 from disk.
-
     Inputs:
     - rs:
     - id:

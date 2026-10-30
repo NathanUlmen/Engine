@@ -1,11 +1,9 @@
 package tests
+import "../src"
 import "core:crypto"
-import "core:fmt"
-import "core:log"
 import "core:os"
 import "core:strings"
 import "core:testing"
-import "src"
 
 create_test_rsrc_sys :: proc() -> ^src.ResourceSystem {
 	rs := new(src.ResourceSystem)
@@ -17,18 +15,18 @@ init_rsrc_sys_with_txt_serializer :: proc() -> ^src.ResourceSystem {
 	context.random_generator = crypto.random_generator()
 	rs := create_test_rsrc_sys()
 	src.rsrc_sys_register_serializer(rs, src.default_txt_serializer())
-    return rs
+	return rs
 }
 
 @(test)
 test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-    rs := init_rsrc_sys_with_txt_serializer()
+	rs := init_rsrc_sys_with_txt_serializer()
 	src.rsrc_sys_import_file(rs, "testData.txt")
 	defer src.rsrc_sys_destroy(rs)
 	file_bytes, _ := os.read_entire_file("testData.txt", context.allocator)
 	defer delete(file_bytes)
-	
+
 
 	string_data := strings.split_lines(string(file_bytes))
 	for id in rs.id_to_artifact {
@@ -42,14 +40,14 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 		testing.expect(t, data != nil)
 
 		//verify our data is correct
-        found := false
-        for s in string_data {
-            if s == (cast(^string)data)^ {
-                found = true
-                break
-            }
-        }
-        testing.expect(t, found)
+		found := false
+		for s in string_data {
+			if s == (cast(^string)data)^ {
+				found = true
+				break
+			}
+		}
+		testing.expect(t, found)
 
 		src.release_handle(rs, handle)
 
@@ -63,6 +61,23 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 
 @(test)
 test_invalid_free :: proc(t: ^testing.T) {
-    rs := init_rsrc_sys_with_txt_serializer()
+	rs := init_rsrc_sys_with_txt_serializer()
 	src.rsrc_sys_destroy(rs)
 }
+
+test_acquire_loaded_resource :: proc(t: ^testing.T) {
+	rs := init_rsrc_sys_with_txt_serializer()
+
+}
+
+test_replace_serializer :: proc(t: ^testing.T) {}
+
+test_copy_resource :: proc(t: ^testing.T) {}
+
+test_load_status :: proc(t: ^testing.T) {}
+
+test_invalid_handle :: proc(t: ^testing.T) {}
+
+test_invalid_id :: proc(t: ^testing.T) {}
+
+test_missing_serializer :: proc(t: ^testing.T) {}
