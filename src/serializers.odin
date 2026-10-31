@@ -5,7 +5,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 
-default_txt_serializer :: proc() -> ResourceSerializier {
+default_txt_serializer :: proc() -> ResourceMarshaller {
 	return {{nil, context_destructor}, ".txt", txt_bake_to_disk, txt_read_from_disk, destroy_resource}
 }
 
@@ -46,11 +46,11 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 	return artifacts, true
 }
 
-txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> rawptr {
+txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> Resource {
 	str_data := string(file_data)
 	ptr := new(string)
 	ptr^ = str_data
-	return ptr
+	return {ptr, u64(len(file_data))}
 }
 
 destroy_resource :: proc(user_data: rawptr, to_free: rawptr, rsrc_sys: ^ResourceSystem) {

@@ -94,7 +94,7 @@ memory inefficient?
 */
 
 ResourceSystem :: struct {
-	serializers:    map[string]ResourceSerializier,
+	serializers:    map[string]ResourceMarshaller,
 	id_to_artifact: map[RsrcId]ResourceArtifact,
 	id_to_loaded:   map[RsrcId]RsrcHandle, //should we point this at the slot instead?
 	sys_allocator:  mem.Allocator,
@@ -117,15 +117,20 @@ RsrcId :: uuid.Identifier
 
 RsrcHandle :: hm.Handle64
 
+Resource :: struct {
+	data:            rawptr,
+	data_size_bytes: u64,
+}
+
 ResourceData :: struct {
 	data: rawptr,
 }
 
 ResourceSlot :: struct {
-	handle:      RsrcHandle,
-	id:          RsrcId,
-	data:        rawptr,
-	checked_out: u32,
+	using resource: Resource,
+	handle:         RsrcHandle,
+	id:             RsrcId,
+	checked_out:    u32,
 }
 
 /*
@@ -163,7 +168,7 @@ ResourceCallback :: struct {
 	cb:        proc(user_data: rawptr, handle: RsrcHandle),
 }
 
-RsrcSerializerContext :: struct {
+MarshallerContext :: struct {
 	user_data:                  rawptr,
 	destroy_serializer_context: proc(user_data: rawptr, allocator: mem.Allocator),
 }
@@ -177,11 +182,11 @@ An "interface" used by the ResourceSystem.
     - hydrate_resource: procedure that is responsible for transforming the file bytes of the artifact into useful data.
     - destroy_resource: destroy a resource created by this serializer.
 */
-ResourceSerializier :: struct {
-	using serializer_context: RsrcSerializerContext,
+ResourceMarshaller :: struct {
+	using serializer_context: MarshallerContext,
 	extension:                string,
 	import_resource:          proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> (a: []ResourceArtifact, ok: bool),
-	hydrate_resource:         proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> rawptr,
+	create_resource:          proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> Resource,
 	destroy_resource:         proc(user_data: rawptr, to_free: rawptr, rsrc_sys: ^ResourceSystem),
 }
 
@@ -199,6 +204,7 @@ ResourceSerializier :: struct {
 ResourceArtifact :: struct {
 	id:                   RsrcId, //maybe we can handle this for the user?
 	dependencies:         []RsrcId,
+	type:                 string,
 	baked_file_path:      string,
 	name:                 string,
 	progenitor_file_path: string, //we can handle
@@ -211,7 +217,7 @@ ResourceArtifact :: struct {
 */
 rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 	rs.sys_allocator = allocator
-	rs.serializers = make(map[string]ResourceSerializier, rs.sys_allocator)
+	rs.serializers = make(map[string]ResourceMarshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.sys_allocator)
 	rs.id_to_loaded = make(map[RsrcId]RsrcHandle, rs.sys_allocator)
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
@@ -234,7 +240,7 @@ rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
     - rs:
     - serializer:
 */
-rsrc_sys_register_serializer :: proc(rs: ^ResourceSystem, serializer: ResourceSerializier) {
+rsrc_sys_register_serializer :: proc(rs: ^ResourceSystem, serializer: ResourceMarshaller) {
 	when ODIN_DEBUG {
 		_, contains := rs.serializers[serializer.extension]
 		log.warnf("Replaced existing serializer responsible for extension %v", serializer.extension)
@@ -295,9 +301,9 @@ handle_acquire :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource
 }
 
 @(private)
-add_new_slot :: proc(rs: ^ResourceSystem, id: RsrcId, raw_data: rawptr) -> (RsrcHandle, Resource_Error) {
+add_new_slot :: proc(rs: ^ResourceSystem, id: RsrcId, resource: Resource) -> (RsrcHandle, Resource_Error) {
 	slot: ResourceSlot = {
-		data        = raw_data,
+		resource    = resource,
 		checked_out = 1,
 		id          = id,
 	}
@@ -488,8 +494,8 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 			//TODO: return an error that matches read file error
 		}
 
-		raw_data := serializer.hydrate_resource(serializer.user_data, bytes, rs, rs.sys_allocator)
-		return add_new_slot(rs, id, raw_data)
+		resource := serializer.create_resource(serializer.user_data, bytes, rs, rs.sys_allocator)
+		return add_new_slot(rs, id, resource)
 	case:
 		return handle, error
 	}
@@ -507,4 +513,78 @@ write_registry_to_disk :: proc(rs: ResourceSystem, output_path: string) -> Resou
 */
 read_registry_from_disk :: proc(rs: ^ResourceSystem, file_path: string) -> Resource_Error {
 	return .None
+}
+
+
+//--------------------
+
+
+/*
+Cache implementation for the resource store.
+
+Requirements:
+- Thread safety that goes well with the resource sys
+- dynamic/adjustable max size
+
+*/
+
+CacheConfig :: struct {
+	max_size_bytes: u64,
+	evic_strat:     Eviction_Strategy,
+}
+
+Eviction_Strategy :: enum {
+	LRU,
+}
+
+CacheEntry :: struct {
+	id:              RsrcId,
+	data:            rawptr,
+	data_size_bytes: u64,
+	destructor:      proc(data: rawptr),
+}
+
+Cache :: struct {
+	current_size_bytes: u64,
+	max_capacity_bytes: u64,
+	entries:            [dynamic]CacheEntry,
+	strategy:           Eviction_Strategy,
+}
+
+add_entry :: proc(cache: ^Cache, to_add: CacheEntry) {
+	new_total := cache.current_size_bytes + to_add.data_size_bytes
+	if new_total > cache.max_capacity_bytes {
+		current := new_total
+		#reverse for entry, index in cache.entries {
+			(current > cache.max_capacity_bytes) or_break
+			current -= entry.data_size_bytes
+			entry.destructor(entry.data)
+			unordered_remove(&cache.entries, index)
+		}
+	}
+	append(&cache.entries, to_add)
+	cache.current_size_bytes += to_add.data_size_bytes
+}
+
+take_entry :: proc(cache: ^Cache, target_id: RsrcId) -> CacheEntry {
+	found := -1
+	target: CacheEntry
+	for entry, index in cache.entries {
+		if entry.id == target_id {
+			found = index
+			target = entry
+			break
+		}
+	}
+	assert(found != -1)
+	ordered_remove(&cache.entries, found)
+	return target
+}
+
+adjust_cache :: proc(cache: ^Cache) {
+
+}
+
+configure_cache :: proc(cache: ^Cache, config: CacheConfig) {
+
 }
