@@ -9,26 +9,108 @@ import "core:path/filepath"
 
 /*
 TBD:
-How/should we make this thing thread safe?
-How should we handle allocation and freeing of resources? How do we enforce everything use the same allocator.
+- How/should we make this thing thread safe without locking aton?
+    * Most of the time we will be acquiring, resolving, and releasing from this thing so we should focus on making those fast.
+    * Writing/loading to the disk is very expensive though, 
+
+- How should we handle allocation and freeing of resources? How do we enforce everything use the same allocator?
+    * I dont think we can enforce the usage of the same allocator but we can make it pretty obvious which one to use
+    by passing one into the interface. - DONE/IMPLEMENTED
+    * For freeing of resources I am conflicted on this... On one hand I dont want to add the complexity of writing destructors
+    but it does give far more flexibility to the end user on what is possible. I think that we should provide a callback and 
+    from there the user decide what should happen. By providing a callback to the user they can then implement things like caching
+    themselves by attaching it to the serializer. I don't like this as I think that serializers should be stateless ideally but also 
+    it gives the user lots of fine grained control over behavior and what happens. For example in regards to caching the user gets fine grained
+    control over which types of resources are cached and which type of strategy is used to do so. On the other hand this makes the structure hard to 
+    make thread safe as it then puts responsibility on the users to ensure that their code is thread safe as well. It also complicates the lifespan of
+    objects as it means that the resource system would need to own the user_data of the serializers.
+    
+    A potential middle ground could be that as apart of the serializer the user can configure caching (enabled, max_size, policy) on a serializer by serializer basis. 
+    They still wouldn't get as fine grained control but but they would get a vast majority of the benefits. 
+
+    I think that in conclusion we should provide a callback to the user when a resource no longer has any references to it as its just to valuable/useful and I think the felxibility it provides is worth it.
+    I think we could prevent 90% of the potential downsides by providing direct caching support. It would give the library ownership around that feature and prevents users from having to roll their own for each serializer.
+    The ownership over that feature would also make it easier to make the structure thread safe. If the user needs a level of finite control over the caching that the configuration would provide I would argue that they should
+    be hand rolling their own custom system or that it shouldnt be apart of this store. They could always take on the responsibility of it themselves too if they insisted on using this system/store too.
+
+    This means that two procs would be added to the interface, a destructor proc which is specifically used to destroy resoruces created by the serializer and a on_references_zero() proc.
+
+    I am almost tempted to remove the user_data field from the serializer interface entirely at this point after thinking about it for a bit as I cant think of any good uses for it that arent code smells or kinda jank setups.
+    But maybe I am being too narrow minded in what I am thinking of. By attaching state to the serializers it leaves the door open for users to shoot themselves in the foot if we go about making this thing thread safe as it becomes
+    this thing is thread safe with some caviates. On the other hand its super nice to have as it would be nice ot have as configuration for the serializer and stuff which. 
+
+    Verdicts:
+    * First class support for caching that is owned by our api.
+        - Where should cache configuration be stored? 
+            * If its stored in the serializer that makes it easy to separate everything out. The downside of this is that
+            resources that are registered with the registry wont have cache support. I would argue that this is fine as 
+            if you need caching for performance reasons you should be registering a serializer and that registering resource.
+            without serializers should only really be done for prototyping purposes or in a scenario where performance isnt super critical.
+    * user_data should stick around but we need to be very explicity about what it should and shouldnt be.
+    * user provided destructors for resources attached to serializers
+    * optional callback on references becoming zero
+
+- Is there a way we can get rid of the when loading user data and have it be type safe? Or at least auto cast for the user before passing it into their code.
+
+- How should we handle baked resource output/automate which path/dir its sent to?
+
+- Should we auto load the dependencies for the user or should we leave it up to them to implement that into read_from_disk?
+    Another question of user control, explicitness, and ergonomics. 
+
+    Currently leaning more towards the system resolving it for the user. Then the user in their serialization code
+    can acquire a handle to the required dependencies and they will already be loaded.
+
+    VERDICT: handle automatically
+
+- How do we provide other avenues for storing resources without requiring stuff to be baked?
+    The current proposed solution is that users can copy data into the system or they can allocate their data using the system allocator and then
+    pass that pointer into the system and it will register it.
+    I think it should be performant as its nice for iteration and prototyping. At this point in time I dont think we should plan on this 
+    being a "second class" path. It should still work well and all that but shouldn't come at the expense of first class features.
+
+    VERDICT: Implement proposed solution as is
+
+- Should we make loading of resources more explicit? Currently acquire has the potential to load a resource if its not present,
+what if instead we had to make it an explicit process to get the resource by having the user do something like:
+
+    if !resources.load_status() == .NOT_REQUESTED {
+        resources.load_resource()
+    }
+    resources.acquire_handle()
+    Pros: 
+        The system is easier to reason about and you know what can happen where.
+        Our functions become simpler and easier to reason about
+        We can always provide a procedure that has the old behavior, just make it more explicit/clear
+    Cons:
+        non really....
+       
+    Verdict: Implement it
+DONE/IMPLEMENTED
+
+- How should we structure the system such that is fast/not pointer hopping but also not 
+memory inefficient?
+
+- Should we rename this to Resource Store?
 */
 
 ResourceSystem :: struct {
 	serializers:    map[string]ResourceSerializier,
 	id_to_artifact: map[RsrcId]ResourceArtifact,
 	id_to_loaded:   map[RsrcId]RsrcHandle, //should we point this at the slot instead?
-	allocator:      mem.Allocator,
+	sys_allocator:  mem.Allocator,
 	handle_map:     hm.Dynamic_Handle_Map(ResourceSlot, hm.Handle64),
 }
 
 Resource_Error :: enum {
 	None,
+	Not_Loaded,
 	Missing_Serializer,
 	Invalid_File,
 	Extraction_Error,
 	Handle_Error,
 	Allocator_Error,
 	Missing_Artifact,
+	Serialization_Error,
 }
 
 RsrcId :: uuid.Identifier
@@ -47,7 +129,8 @@ ResourceSlot :: struct {
 }
 
 /*
-Describes the status of a asynchronously loaded resource.
+Describes the status of a resource.
+    - NOT_REQUESTED: Resource is not loaded at all.
     - SCHEDULED: Request is in the queue and awaits processing
     - IN_PROGRESS: Resource is currently being loaded.
     - COMPLETED: Resource has been loaded and its callback has been dispatched.
@@ -75,23 +158,31 @@ Dispatcher :: struct {
 	post: proc(runnable: proc()),
 }
 
-ResourceCallback :: proc(user_data: rawptr, handle: RsrcHandle)
+ResourceCallback :: struct {
+	user_data: rawptr,
+	cb:        proc(user_data: rawptr, handle: RsrcHandle),
+}
+
+RsrcSerializerContext :: struct {
+	user_data:                  rawptr,
+	destroy_serializer_context: proc(user_data: rawptr, allocator: mem.Allocator),
+}
 
 /*
 An "interface" used by the ResourceSystem.
     Fields:
     - user_data: custom user data field 
     - extension: file extension that this serializer is capable of handling. Must include the '.' EX: ".txt"
-    - extract: procedure that is responsible for opening and reading out the file contents into data that bake_to_disk can consume.
-    - bake_to_disk: procedure that is responsible for consuming the results of extract and producing artifacts that are written to disk.
-    - read_from_disk: procedure that is responsible for consuming/constructing runtime data from artifacts produced by bake_to_disk.
+    - import_resource: 
+    - hydrate_resource: procedure that is responsible for transforming the file bytes of the artifact into useful data.
+    - destroy_resource: destroy a resource created by this serializer.
 */
 ResourceSerializier :: struct {
-	user_data:      rawptr,
-	extension:      string,
-	extract:        proc(user_data: rawptr, file_path: string) -> (rawptr, Resource_Error),
-	bake_to_disk:   proc(user_data: rawptr, extracted_data: rawptr) -> []ResourceArtifact,
-	read_from_disk: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem) -> rawptr,
+	using serializer_context: RsrcSerializerContext,
+	extension:                string,
+	import_resource:          proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> (a: []ResourceArtifact, ok: bool),
+	hydrate_resource:         proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> rawptr,
+	destroy_resource:         proc(user_data: rawptr, to_free: rawptr, rsrc_sys: ^ResourceSystem),
 }
 
 /*
@@ -106,7 +197,7 @@ ResourceSerializier :: struct {
 
 */
 ResourceArtifact :: struct {
-	id:                   RsrcId, //maybe we can handle?
+	id:                   RsrcId, //maybe we can handle this for the user?
 	dependencies:         []RsrcId,
 	baked_file_path:      string,
 	name:                 string,
@@ -119,11 +210,11 @@ ResourceArtifact :: struct {
 
 */
 rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
-	rs.allocator = allocator
-	rs.serializers = make(map[string]ResourceSerializier, rs.allocator)
-	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.allocator)
-	rs.id_to_loaded = make(map[RsrcId]RsrcHandle, rs.allocator)
-	hm.dynamic_init(&rs.handle_map, rs.allocator)
+	rs.sys_allocator = allocator
+	rs.serializers = make(map[string]ResourceSerializier, rs.sys_allocator)
+	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.sys_allocator)
+	rs.id_to_loaded = make(map[RsrcId]RsrcHandle, rs.sys_allocator)
+	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 }
 
 /*
@@ -133,10 +224,9 @@ rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
 	hm.dynamic_destroy(&rs.handle_map)
 	//TODO: Revist this later. (Maybe add a delete proc to the Serializer ?)
 	for _, serializer in rs.serializers {
-		free(serializer.user_data)
+		serializer.destroy_serializer_context(serializer.user_data, rs.sys_allocator)
 	}
-	free_all(rs.allocator)
-
+	free_all(rs.sys_allocator)
 }
 
 /*
@@ -151,30 +241,31 @@ rsrc_sys_register_serializer :: proc(rs: ^ResourceSystem, serializer: ResourceSe
 	}
 	to_replace, contained := rs.serializers[serializer.extension]
 	if contained {
-		free(to_replace.user_data, rs.allocator)
+		to_replace.destroy_serializer_context(to_replace.user_data, rs.sys_allocator)
 	}
 	rs.serializers[serializer.extension] = serializer
 }
 
 /*
-Produces asset artifact(s) from a target_file
+Produces resrouce artifact(s) from a target_file
     Inputs:
     - rs:
     - target_file:
 */
 rsrc_sys_import_file :: proc(rs: ^ResourceSystem, target_file: string) -> Resource_Error {
-	context.allocator = rs.allocator
+	//Retrieve serializer
 	extension := filepath.ext(target_file)
 	serializer, contains := rs.serializers[extension]
 	if !contains {
 		return Resource_Error.Missing_Serializer
 	}
-	data, err := serializer.extract(serializer.user_data, target_file)
-	if err != nil {
-		return err
+
+	artifacts, ok := serializer.import_resource(serializer.user_data, target_file, rs.sys_allocator)
+	if !ok {
+		return .Serialization_Error
 	}
-	//TODO: make bake to disk return an error
-	artifacts := serializer.bake_to_disk(serializer.user_data, data)
+
+	//update the extension
 	for &artifact in artifacts {
 		artifact._extension = extension
 		rs.id_to_artifact[artifact.id] = artifact
@@ -183,13 +274,13 @@ rsrc_sys_import_file :: proc(rs: ^ResourceSystem, target_file: string) -> Resour
 }
 
 /*
-Acquires a handle to a resource in a synchronous/blocking manner.
+Acquires a handle to an already loaded resource. If the resource state is not COMPLETED will return an error.
     Inputs:
     - rs: the ResourceSystem to 
     - id: The stable id to the resource you wish to read from memory.
-
     Returns:
     - ResourceHandle: A handle to the resource.
+    - Resource_Error: 
 */
 handle_acquire :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_Error) {
 	target, loaded := rs.id_to_loaded[id]
@@ -199,24 +290,8 @@ handle_acquire :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource
 			return {}, .Handle_Error
 		}
 		return duplicate_handle(rs, slot.handle)
-	} else {
-		artifact, contained := rs.id_to_artifact[id]
-		if !contained {
-			//Might want to change the name of this error later on...
-			return {}, .Missing_Artifact
-		}
-		serializer, ok := rs.serializers[artifact._extension]
-		if !ok {
-			return {}, .Missing_Serializer
-		}
-		bytes, err := os.read_entire_file(artifact.baked_file_path, rs.allocator)
-		if err != nil {
-			//TODO
-		}
-		context.allocator = rs.allocator
-		raw_data := serializer.read_from_disk(serializer.user_data, bytes, rs)
-		return add_new_slot(rs, id, raw_data)
 	}
+	return {}, .Not_Loaded
 }
 
 @(private)
@@ -242,14 +317,21 @@ Acquires a handle to a resource in an asynchronous manner. If the requested reso
 yet loaded it is loaded asynchronously. Once the resource is loaded into Memory the callback
 is sent to the dispatcher where it can then be fired. If the requested resource is already in memory 
 the callback is sent to the dispatcher immediately.
-
     Inputs:
     - rs: the ResourceSystem to 
     - id: The stable id to the resource you wish to read from memory.
     - callback: the procedure to execute once the resource has been acquired.
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
-handle_acquire_async :: proc(rsrc_sys: ^ResourceSystem, id: RsrcId, callback: ResourceCallback, cb_dispatcher: Dispatcher) -> ResourceFuture {
+handle_acquire_async :: proc(rs: ^ResourceSystem, id: RsrcId, callback: ResourceCallback, cb_dispatcher: Dispatcher) -> ResourceFuture {
+	result, contained := rs.id_to_loaded[id]
+	if contained {
+		slot, _ := hm.dynamic_get(&rs.handle_map, result)
+		slot.checked_out += 1
+		//TODO: post callback to dispatcher
+		return ResourceFuture{.COMPLETED}
+	}
+
 	panic("handle_acquire_async Unimplemented")
 }
 
@@ -261,6 +343,7 @@ handle_batch_acquire_async :: proc(rs: ^ResourceSystem) -> ResourceFuture {
 }
 
 /*
+
 
 */
 release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Error {
@@ -277,19 +360,17 @@ release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Erro
 	if slot.checked_out == 0 {
 		hm.dynamic_remove(&rs.handle_map, handle)
 		rs.id_to_loaded[slot.id] = {}
-		//TODO: Look into adding another callback instead of just blindly freeing here
-		defer free(slot.data, rs.allocator)
+		//TODO: implement the serializer destructor here instead of this free...
+		defer free(slot.data, rs.sys_allocator)
 	}
 	return .None
 }
 
 /*
 Resolves/dereferrences what ever the resource handle points to, this is used to get the raw data that is stored.
-
     Inputs:
     - rs:
     - handle:
-
     Returns:
     - rawptr: pointer to the actual data stored inside the system
 */
@@ -308,7 +389,6 @@ from disk.
     Inputs:
     - rs:
     - id:
-
     Returns:
     - new_id: 
     - handle: 
@@ -319,11 +399,11 @@ resource_shallow_copy :: proc {
 }
 
 resource_shallow_copy_on_id :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcId, RsrcHandle) {
-	return {}, {}
+	panic("TODO: resource_shallow_copy_on_id Unimplemented")
 }
 
 resource_shallow_copy_on_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> (RsrcId, RsrcHandle) {
-	return {}, {}
+	panic("TODO: resource_shallow_copy_on_handle Unimplemented")
 }
 
 /*
@@ -354,7 +434,7 @@ It's probably a good idea to free the original after calling this procedure.
     - the id to this handle
 */
 copy_resource_into_registry :: proc(rs: ^ResourceSystem, to_register: rawptr) -> (RsrcId, RsrcHandle, Resource_Error) {
-	return {}, {}, .None
+	panic("TODO: copy_resource_into_registry is Unimplemented")
 }
 
 /*
@@ -368,8 +448,7 @@ Assumes that the resource to be registered was allocated with the same allocator
     - Error status
 */
 resource_register :: proc(rs: ^ResourceSystem, to_register: rawptr) -> (RsrcId, RsrcHandle, Resource_Error) {
-	new_id := uuid.generate_v7()
-	return new_id, add_new_slot(rs, new_id, to_register)
+	panic("TODO: resource_register is Unimplemented")
 }
 
 /*
@@ -377,6 +456,43 @@ resource_register :: proc(rs: ^ResourceSystem, to_register: rawptr) -> (RsrcId, 
 */
 resource_load_status :: proc(rs: ^ResourceSystem, id: RsrcId) -> Load_Status {
 	panic("TODO: resource_load_status Unimplemented")
+}
+
+/*
+Loads a resource in a synchronous/blocking fashion and gives you a handle to it. If the resource is already 
+loaded you will recieve a hanlde to it
+    Inputs:
+    - rs:
+    - id:
+    Returns:
+    - RsrcHandle:
+    - Resource_Error:
+*/
+load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_Error) {
+	handle, error := handle_acquire(rs, id)
+	#partial switch error {
+	case .Not_Loaded:
+		artifact, contained := rs.id_to_artifact[id]
+		if !contained {
+			//Might want to change the name of this error later on...
+			return {}, .Missing_Artifact
+		}
+		//retrieve serializer
+		serializer, ok := rs.serializers[artifact._extension]
+		if !ok {
+			return {}, .Missing_Serializer
+		}
+
+		bytes, err := os.read_entire_file(artifact.baked_file_path, rs.sys_allocator)
+		if err != nil {
+			//TODO: return an error that matches read file error
+		}
+
+		raw_data := serializer.hydrate_resource(serializer.user_data, bytes, rs, rs.sys_allocator)
+		return add_new_slot(rs, id, raw_data)
+	case:
+		return handle, error
+	}
 }
 
 /*

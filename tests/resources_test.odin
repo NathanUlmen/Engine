@@ -31,7 +31,7 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 	string_data := strings.split_lines(string(file_bytes))
 	for id in rs.id_to_artifact {
 		//acqurie handle
-		handle, error := src.handle_acquire(rs, id)
+		handle, error := src.load_resource(rs, id)
 		testing.expect(t, error == .None)
 
 		//resolve out handle and get the data.

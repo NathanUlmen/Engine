@@ -1,12 +1,12 @@
 package main
 import "core:encoding/uuid"
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 
-
 default_txt_serializer :: proc() -> ResourceSerializier {
-	return {nil, ".txt", txt_extract, txt_bake_to_disk, txt_read_from_disk}
+	return {{nil, context_destructor}, ".txt", txt_bake_to_disk, txt_read_from_disk, destroy_resource}
 }
 
 txt_extract :: proc(user_data: rawptr, file_path: string) -> (rawptr, Resource_Error) {
@@ -21,14 +21,14 @@ txt_extract :: proc(user_data: rawptr, file_path: string) -> (rawptr, Resource_E
 	return rawptr(stored), .None
 }
 
-txt_bake_to_disk :: proc(user_data: rawptr, extracted_data: rawptr) -> []ResourceArtifact {
-	str_data := cast(^string)extracted_data
+txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> ([]ResourceArtifact, bool) {
+	file_bytes, _ := os.read_entire_file(file_path, allocator)
+	str_data := string(file_bytes)
 	defer {
-		delete(str_data^)
-		free(extracted_data)
+		delete(file_bytes)
 	}
 
-	split, err := strings.split_lines(str_data^)
+	split, err := strings.split_lines(str_data)
 	defer delete(split)
 	artifacts := make([]ResourceArtifact, len(split))
 	defer delete(artifacts)
@@ -43,12 +43,20 @@ txt_bake_to_disk :: proc(user_data: rawptr, extracted_data: rawptr) -> []Resourc
 			import_version  = 1,
 		}
 	}
-	return artifacts
+	return artifacts, true
 }
 
-txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem) -> rawptr {
+txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> rawptr {
 	str_data := string(file_data)
 	ptr := new(string)
 	ptr^ = str_data
 	return ptr
+}
+
+destroy_resource :: proc(user_data: rawptr, to_free: rawptr, rsrc_sys: ^ResourceSystem) {
+	free(to_free)
+}
+
+context_destructor :: proc(data: rawptr, allocator: mem.Allocator) {
+
 }
