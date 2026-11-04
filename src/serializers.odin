@@ -6,6 +6,8 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 
+TEXT_CACHE_CATEGORY :: CacheId(0)
+
 default_txt_serializer :: proc() -> ResourceMarshaller {
 	return {{nil, context_destructor}, ".txt", txt_bake_to_disk, txt_read_from_disk}
 }
@@ -38,6 +40,7 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 		err := os.write_entire_file(file_path, line)
 		artifacts[i] = {
 			id              = uuid.generate_v7_basic(nil),
+			cache_category  = {{1024, .LRU}, TEXT_CACHE_CATEGORY},
 			dependencies    = nil,
 			baked_file_path = file_path,
 			name            = file_path,

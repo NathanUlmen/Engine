@@ -9,11 +9,18 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 
+CacheId :: distinct u32
+
+CacheCategory :: struct {
+	cache_config: CacheConfig,
+	category_id:  CacheId,
+}
+
 ResourceSystem :: struct {
 	serializers:    map[string]ResourceMarshaller,
 	id_to_artifact: map[RsrcId]ResourceArtifact,
 	id_to_loaded:   map[RsrcId]RsrcHandle,
-	cache:          Cache,
+	cache_lookup:   map[CacheId]^Cache,
 	sys_allocator:  mem.Allocator,
 	handle_map:     hm.Dynamic_Handle_Map(ResourceSlot, hm.Handle64),
 }
@@ -121,6 +128,7 @@ ResourceMarshaller :: struct {
 */
 ResourceArtifact :: struct {
 	id:                   RsrcId, //maybe we can handle this for the user?
+	cache_category:       CacheCategory,
 	dependencies:         []RsrcId,
 	type:                 string,
 	baked_file_path:      string,
@@ -139,7 +147,7 @@ rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 	rs.serializers = make(map[string]ResourceMarshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.sys_allocator)
 	rs.id_to_loaded = make(map[RsrcId]RsrcHandle, rs.sys_allocator)
-	cache_init(&rs.cache, rs.sys_allocator, {1024, .LRU})
+	// cache_init(&rs.cache, rs.sys_allocator, {1024, .LRU})
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 }
 
@@ -150,7 +158,7 @@ rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
 	hm.dynamic_destroy(&rs.handle_map)
 
 	//TODO: Revist this later. (Maybe add a delete proc to the Serializer ?)
-	cache_destroy(rs, &rs.cache)
+	// cache_destroy(rs, &rs.cache)
 	for _, serializer in rs.serializers {
 		serializer.destroy_serializer_context(serializer.user_data, rs.sys_allocator)
 	}
@@ -287,7 +295,11 @@ release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Erro
 
 	if slot.checked_out == 0 {
 		hm.dynamic_remove(&rs.handle_map, handle)
-		cache_add_entry(rs, &rs.cache, {slot.id, slot^})
+		artifact, contains := rs.id_to_artifact[slot.id]
+		assert(contains)
+		cache, err := ensure_cache_artifact(rs, artifact)
+		assert(err == .None)
+		cache_add_entry(rs, cache, {slot.id, slot^})
 	}
 	return .None
 }
@@ -359,7 +371,7 @@ It's probably a good idea to free the original after calling this procedure.
     Returns:
     - the id to this handle
 */
-copy_resource_into_registry :: proc(rs: ^ResourceSystem, to_register: rawptr) -> (RsrcId, RsrcHandle, Resource_Error) {
+copy_resource_into_registry :: proc(rs: ^ResourceSystem, to_register: rawptr, cache_category: CacheCategory) -> (RsrcId, RsrcHandle, Resource_Error) {
 	panic("TODO: copy_resource_into_registry is Unimplemented")
 }
 
@@ -373,7 +385,7 @@ Assumes that the resource to be registered was allocated with the same allocator
     - Handle to the registered resource
     - Error status
 */
-resource_register :: proc(rs: ^ResourceSystem, to_register: rawptr) -> (RsrcId, RsrcHandle, Resource_Error) {
+resource_register :: proc(rs: ^ResourceSystem, to_register: rawptr, cache_category: CacheCategory) -> (RsrcId, RsrcHandle, Resource_Error) {
 	panic("TODO: resource_register is Unimplemented")
 }
 
@@ -404,24 +416,30 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 	#partial switch error {
 	case .Not_Loaded:
 		//check out cache here first...
-		result, cache_hit := cache_take_entry(rs, &rs.cache, id)
-		if cache_hit {
-			return add_new_slot(rs, id, result.resource)
-		}
-
-		artifact, contained := rs.id_to_artifact[id]
-		if !contained {
-			//Might want to change the name of this error later on...
+		artifact, contains := rs.id_to_artifact[id]
+		if !contains {
 			return {}, .Missing_Artifact
 		}
+
+		//handle our cache
+		if cache, err := ensure_cache(rs, artifact); err != .None {
+			if err == .Missing_Artifact {
+				return {}, err
+			}
+			result, cache_hit := cache_take_entry(rs, cache, id)
+			if cache_hit {
+				return add_new_slot(rs, id, result.resource)
+			}
+		}
+
 		//retrieve serializer
 		serializer, ok := rs.serializers[artifact._extension]
 		if !ok {
 			return {}, .Missing_Serializer
 		}
 
-		bytes, err := os.read_entire_file(artifact.baked_file_path, rs.sys_allocator)
-		if err != nil {
+		bytes, read_err := os.read_entire_file(artifact.baked_file_path, rs.sys_allocator)
+		if read_err != nil {
 			//TODO: return an error that matches read file error
 		}
 
@@ -431,6 +449,28 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 	case:
 		return handle, error
 	}
+}
+
+
+ensure_cache :: proc {
+	ensure_cache_artifact,
+	ensure_cache_id,
+}
+
+@(private)
+ensure_cache_artifact :: proc(rs: ^ResourceSystem, artifact: ResourceArtifact) -> (^Cache, Resource_Error) {
+	return ensure_cache_id(rs, artifact.cache_category.category_id, artifact.cache_category.cache_config)
+}
+
+@(private)
+ensure_cache_id :: proc(rs: ^ResourceSystem, category_id: CacheId, cache_config: CacheConfig) -> (^Cache, Resource_Error) {
+	cache_ptr, cache_contained := rs.cache_lookup[category_id]
+	if !cache_contained {
+		cache_ptr = new(Cache, rs.sys_allocator)
+		cache_init(cache_ptr, rs.sys_allocator, cache_config)
+		rs.cache_lookup[category_id] = cache_ptr
+	}
+	return cache_ptr, .None
 }
 
 /*
@@ -538,7 +578,8 @@ cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^Cache) {
 	}
 }
 
-cache_configure :: proc(rs: ^ResourceSystem, cache: ^Cache, config: CacheConfig) {
+cache_configure :: proc(rs: ^ResourceSystem, cache_id: CacheId, config: CacheConfig) {
+	cache, err := ensure_cache_id(rs, cache_id, config)
 	cache.max_capacity_bytes = config.max_size_bytes
 	cache.strategy = config.evict_strat
 	cache_ensure_limit(rs, cache)
