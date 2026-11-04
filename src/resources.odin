@@ -374,7 +374,7 @@ release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Erro
 
 	if slot.checked_out == 0 {
 		hm.dynamic_remove(&rs.handle_map, handle)
-		cache_add_entry(rs, &rs.cache, {slot.id, slot})
+		cache_add_entry(rs, &rs.cache, {slot.id, slot^})
 	}
 	return .None
 }
@@ -486,7 +486,7 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 	#partial switch error {
 	case .Not_Loaded:
 		//check out cache here first...
-		result, cache_hit := take_entry(rs, &rs.cache, id)
+		result, cache_hit := cache_take_entry(rs, &rs.cache, id)
 		if cache_hit {
 			return add_new_slot(rs, id, result.resource)
 		}
@@ -557,7 +557,7 @@ CacheNode :: struct {
 
 CacheEntry :: struct {
 	id:       RsrcId,
-	resource: ^ResourceSlot,
+	resource: ResourceSlot,
 }
 
 Cache :: struct {
@@ -573,7 +573,14 @@ cache_init :: proc(c: ^Cache, allocator: mem.Allocator, config: CacheConfig) {
 }
 
 cache_destroy :: proc(rs: ^ResourceSystem, c: ^Cache) {
+	for !list.is_empty(&c.linked_list) {
+		link := list.pop_back(&c.linked_list)
+		node := container_of(link, CacheNode, "link")
+		node.entry.resource.destructor(node.entry.resource.data, rs)
+		free(node)
+	}
 	delete(c.entry_lookup)
+	c.current_size_bytes = 0
 }
 
 cache_add_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, to_add: CacheEntry) {
@@ -585,28 +592,31 @@ cache_add_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, to_add: CacheEntry) 
 	cache_ensure_limit(rs, cache)
 }
 
-take_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, target_id: RsrcId) -> (target: CacheEntry, contained: bool) {
-	result, has := cache.entry_lookup[target_id]
+cache_take_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, target_id: RsrcId) -> (target: CacheEntry, contained: bool) {
+	to_remove, has := cache.entry_lookup[target_id]
 	if !has {
-		return result.entry, contained
+		return {}, false
 	}
-	list.remove(&cache.linked_list, result)
-	defer free(result)
-	return result.entry, has
+	delete_key(&cache.entry_lookup, target_id)
+	list.remove(&cache.linked_list, &to_remove.link)
+	defer free(to_remove)
+	return to_remove.entry, true
 }
 
-@(private)
 cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^Cache) {
-	current := cache.current_size_bytes
 	for cache.current_size_bytes > cache.max_capacity_bytes && !list.is_empty(&cache.linked_list) {
-		result_node := list.pop_back(&cache.linked_list)
-		node := container_of(result_node, CacheNode, "link")
-		cache.current_size_bytes -= node.entry.resource.data_size_bytes
-		node.entry.resource.destructor(node.entry.resource.data, rs)
+		last := cache.linked_list.tail
+		node := container_of(last, CacheNode, "link")
+		removed, _ := cache_take_entry(rs, cache, node.entry.id)
+		handle, _ := rs.id_to_loaded[removed.id]
+		delete_key(&rs.id_to_loaded, removed.id)
+		hm.dynamic_remove(&rs.handle_map, handle)
+		cache.current_size_bytes -= removed.resource.data_size_bytes
+		removed.resource.destructor(removed.resource.data, rs)
 	}
 }
 
-configure_cache :: proc(rs: ^ResourceSystem, cache: ^Cache, config: CacheConfig) {
+cache_configure :: proc(rs: ^ResourceSystem, cache: ^Cache, config: CacheConfig) {
 	cache.max_capacity_bytes = config.max_size_bytes
 	cache.strategy = config.evic_strat
 	if (cache.current_size_bytes > cache.max_capacity_bytes) do cache_ensure_limit(rs, cache)
