@@ -1,6 +1,7 @@
 package main
 
 import hm "core:container/handle_map"
+import list "core:container/intrusive/list"
 import "core:encoding/uuid"
 import "core:log"
 import "core:mem"
@@ -91,12 +92,16 @@ DONE/IMPLEMENTED
 memory inefficient?
 
 - Should we rename this to Resource Store?
+
+- How should things with dependencies calculate their sizes?
+
 */
 
 ResourceSystem :: struct {
 	serializers:    map[string]ResourceMarshaller,
 	id_to_artifact: map[RsrcId]ResourceArtifact,
 	id_to_loaded:   map[RsrcId]RsrcHandle, //should we point this at the slot instead?
+	cache:          Cache,
 	sys_allocator:  mem.Allocator,
 	handle_map:     hm.Dynamic_Handle_Map(ResourceSlot, hm.Handle64),
 }
@@ -111,6 +116,7 @@ Resource_Error :: enum {
 	Allocator_Error,
 	Missing_Artifact,
 	Serialization_Error,
+	Missing_File,
 }
 
 RsrcId :: uuid.Identifier
@@ -120,6 +126,7 @@ RsrcHandle :: hm.Handle64
 Resource :: struct {
 	data:            rawptr,
 	data_size_bytes: u64,
+	destructor:      proc(to_free: rawptr, rs: ^ResourceSystem),
 }
 
 ResourceData :: struct {
@@ -187,7 +194,6 @@ ResourceMarshaller :: struct {
 	extension:                string,
 	import_resource:          proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> (a: []ResourceArtifact, ok: bool),
 	create_resource:          proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> Resource,
-	destroy_resource:         proc(user_data: rawptr, to_free: rawptr, rsrc_sys: ^ResourceSystem),
 }
 
 /*
@@ -220,6 +226,7 @@ rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 	rs.serializers = make(map[string]ResourceMarshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.sys_allocator)
 	rs.id_to_loaded = make(map[RsrcId]RsrcHandle, rs.sys_allocator)
+	cache_init(&rs.cache, rs.sys_allocator, {1024, .LRU})
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 }
 
@@ -228,7 +235,9 @@ rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 */
 rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
 	hm.dynamic_destroy(&rs.handle_map)
+
 	//TODO: Revist this later. (Maybe add a delete proc to the Serializer ?)
+	cache_destroy(rs, &rs.cache)
 	for _, serializer in rs.serializers {
 		serializer.destroy_serializer_context(serializer.user_data, rs.sys_allocator)
 	}
@@ -365,9 +374,7 @@ release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Erro
 
 	if slot.checked_out == 0 {
 		hm.dynamic_remove(&rs.handle_map, handle)
-		rs.id_to_loaded[slot.id] = {}
-		//TODO: implement the serializer destructor here instead of this free...
-		defer free(slot.data, rs.sys_allocator)
+		cache_add_entry(rs, &rs.cache, {slot.id, slot})
 	}
 	return .None
 }
@@ -478,6 +485,12 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 	handle, error := handle_acquire(rs, id)
 	#partial switch error {
 	case .Not_Loaded:
+		//check out cache here first...
+		result, cache_hit := take_entry(rs, &rs.cache, id)
+		if cache_hit {
+			return add_new_slot(rs, id, result.resource)
+		}
+
 		artifact, contained := rs.id_to_artifact[id]
 		if !contained {
 			//Might want to change the name of this error later on...
@@ -505,14 +518,14 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 
 */
 write_registry_to_disk :: proc(rs: ResourceSystem, output_path: string) -> Resource_Error {
-	return .None
+	panic("TODO write_registry_to_disk Unimplemented")
 }
 
 /*
 
 */
 read_registry_from_disk :: proc(rs: ^ResourceSystem, file_path: string) -> Resource_Error {
-	return .None
+	panic("TODO read_reg_from_disk Unimplemented")
 }
 
 
@@ -537,54 +550,65 @@ Eviction_Strategy :: enum {
 	LRU,
 }
 
+CacheNode :: struct {
+	using link: list.Node,
+	entry:      CacheEntry,
+}
+
 CacheEntry :: struct {
-	id:              RsrcId,
-	data:            rawptr,
-	data_size_bytes: u64,
-	destructor:      proc(data: rawptr),
+	id:       RsrcId,
+	resource: ^ResourceSlot,
 }
 
 Cache :: struct {
+	entry_lookup:       map[RsrcId]^CacheNode,
 	current_size_bytes: u64,
 	max_capacity_bytes: u64,
-	entries:            [dynamic]CacheEntry,
 	strategy:           Eviction_Strategy,
+	linked_list:        list.List,
 }
 
-add_entry :: proc(cache: ^Cache, to_add: CacheEntry) {
-	new_total := cache.current_size_bytes + to_add.data_size_bytes
-	if new_total > cache.max_capacity_bytes {
-		current := new_total
-		#reverse for entry, index in cache.entries {
-			(current > cache.max_capacity_bytes) or_break
-			current -= entry.data_size_bytes
-			entry.destructor(entry.data)
-			unordered_remove(&cache.entries, index)
-		}
+cache_init :: proc(c: ^Cache, allocator: mem.Allocator, config: CacheConfig) {
+	c.entry_lookup = make(map[RsrcId]^CacheNode, allocator)
+}
+
+cache_destroy :: proc(rs: ^ResourceSystem, c: ^Cache) {
+	delete(c.entry_lookup)
+}
+
+cache_add_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, to_add: CacheEntry) {
+	new_node := new(CacheNode)
+	new_node.entry = to_add
+	cache.entry_lookup[to_add.id] = new_node
+	cache.current_size_bytes += to_add.resource.data_size_bytes
+	list.push_front(&cache.linked_list, new_node)
+	cache_ensure_limit(rs, cache)
+}
+
+take_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, target_id: RsrcId) -> (target: CacheEntry, contained: bool) {
+	result, has := cache.entry_lookup[target_id]
+	if !has {
+		return result.entry, contained
 	}
-	append(&cache.entries, to_add)
-	cache.current_size_bytes += to_add.data_size_bytes
+	list.remove(&cache.linked_list, result)
+	defer free(result)
+	return result.entry, has
 }
 
-take_entry :: proc(cache: ^Cache, target_id: RsrcId) -> CacheEntry {
-	found := -1
-	target: CacheEntry
-	for entry, index in cache.entries {
-		if entry.id == target_id {
-			found = index
-			target = entry
-			break
-		}
+@(private)
+cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^Cache) {
+	current := cache.current_size_bytes
+	for cache.current_size_bytes > cache.max_capacity_bytes && !list.is_empty(&cache.linked_list) {
+		result_node := list.pop_back(&cache.linked_list)
+		node := container_of(result_node, CacheNode, "link")
+		cache.current_size_bytes -= node.entry.resource.data_size_bytes
+		node.entry.resource.destructor(node.entry.resource.data, rs)
 	}
-	assert(found != -1)
-	ordered_remove(&cache.entries, found)
-	return target
 }
 
-adjust_cache :: proc(cache: ^Cache) {
-
-}
-
-configure_cache :: proc(cache: ^Cache, config: CacheConfig) {
+configure_cache :: proc(rs: ^ResourceSystem, cache: ^Cache, config: CacheConfig) {
+	cache.max_capacity_bytes = config.max_size_bytes
+	cache.strategy = config.evic_strat
+	if (cache.current_size_bytes > cache.max_capacity_bytes) do cache_ensure_limit(rs, cache)
 
 }

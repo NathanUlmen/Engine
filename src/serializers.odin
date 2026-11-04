@@ -6,7 +6,7 @@ import "core:os"
 import "core:strings"
 
 default_txt_serializer :: proc() -> ResourceMarshaller {
-	return {{nil, context_destructor}, ".txt", txt_bake_to_disk, txt_read_from_disk, destroy_resource}
+	return {{nil, context_destructor}, ".txt", txt_bake_to_disk, txt_read_from_disk}
 }
 
 txt_extract :: proc(user_data: rawptr, file_path: string) -> (rawptr, Resource_Error) {
@@ -50,10 +50,10 @@ txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^Reso
 	str_data := string(file_data)
 	ptr := new(string)
 	ptr^ = str_data
-	return {ptr, u64(len(file_data))}
+	return {ptr, u64(len(file_data)), destroy_resource}
 }
 
-destroy_resource :: proc(user_data: rawptr, to_free: rawptr, rsrc_sys: ^ResourceSystem) {
+destroy_resource :: proc(to_free: rawptr, rsrc_sys: ^ResourceSystem) {
 	free(to_free)
 }
 
