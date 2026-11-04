@@ -1,5 +1,6 @@
 package main
 
+import "base:runtime"
 import hm "core:container/handle_map"
 import list "core:container/intrusive/list"
 import "core:encoding/uuid"
@@ -8,99 +9,10 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 
-/*
-TBD:
-- How/should we make this thing thread safe without locking aton?
-    * Most of the time we will be acquiring, resolving, and releasing from this thing so we should focus on making those fast.
-    * Writing/loading to the disk is very expensive though, 
-
-- How should we handle allocation and freeing of resources? How do we enforce everything use the same allocator?
-    * I dont think we can enforce the usage of the same allocator but we can make it pretty obvious which one to use
-    by passing one into the interface. - DONE/IMPLEMENTED
-    * For freeing of resources I am conflicted on this... On one hand I dont want to add the complexity of writing destructors
-    but it does give far more flexibility to the end user on what is possible. I think that we should provide a callback and 
-    from there the user decide what should happen. By providing a callback to the user they can then implement things like caching
-    themselves by attaching it to the serializer. I don't like this as I think that serializers should be stateless ideally but also 
-    it gives the user lots of fine grained control over behavior and what happens. For example in regards to caching the user gets fine grained
-    control over which types of resources are cached and which type of strategy is used to do so. On the other hand this makes the structure hard to 
-    make thread safe as it then puts responsibility on the users to ensure that their code is thread safe as well. It also complicates the lifespan of
-    objects as it means that the resource system would need to own the user_data of the serializers.
-    
-    A potential middle ground could be that as apart of the serializer the user can configure caching (enabled, max_size, policy) on a serializer by serializer basis. 
-    They still wouldn't get as fine grained control but but they would get a vast majority of the benefits. 
-
-    I think that in conclusion we should provide a callback to the user when a resource no longer has any references to it as its just to valuable/useful and I think the felxibility it provides is worth it.
-    I think we could prevent 90% of the potential downsides by providing direct caching support. It would give the library ownership around that feature and prevents users from having to roll their own for each serializer.
-    The ownership over that feature would also make it easier to make the structure thread safe. If the user needs a level of finite control over the caching that the configuration would provide I would argue that they should
-    be hand rolling their own custom system or that it shouldnt be apart of this store. They could always take on the responsibility of it themselves too if they insisted on using this system/store too.
-
-    This means that two procs would be added to the interface, a destructor proc which is specifically used to destroy resoruces created by the serializer and a on_references_zero() proc.
-
-    I am almost tempted to remove the user_data field from the serializer interface entirely at this point after thinking about it for a bit as I cant think of any good uses for it that arent code smells or kinda jank setups.
-    But maybe I am being too narrow minded in what I am thinking of. By attaching state to the serializers it leaves the door open for users to shoot themselves in the foot if we go about making this thing thread safe as it becomes
-    this thing is thread safe with some caviates. On the other hand its super nice to have as it would be nice ot have as configuration for the serializer and stuff which. 
-
-    Verdicts:
-    * First class support for caching that is owned by our api.
-        - Where should cache configuration be stored? 
-            * If its stored in the serializer that makes it easy to separate everything out. The downside of this is that
-            resources that are registered with the registry wont have cache support. I would argue that this is fine as 
-            if you need caching for performance reasons you should be registering a serializer and that registering resource.
-            without serializers should only really be done for prototyping purposes or in a scenario where performance isnt super critical.
-    * user_data should stick around but we need to be very explicity about what it should and shouldnt be.
-    * user provided destructors for resources attached to serializers
-    * optional callback on references becoming zero
-
-- Is there a way we can get rid of the when loading user data and have it be type safe? Or at least auto cast for the user before passing it into their code.
-
-- How should we handle baked resource output/automate which path/dir its sent to?
-
-- Should we auto load the dependencies for the user or should we leave it up to them to implement that into read_from_disk?
-    Another question of user control, explicitness, and ergonomics. 
-
-    Currently leaning more towards the system resolving it for the user. Then the user in their serialization code
-    can acquire a handle to the required dependencies and they will already be loaded.
-
-    VERDICT: handle automatically
-
-- How do we provide other avenues for storing resources without requiring stuff to be baked?
-    The current proposed solution is that users can copy data into the system or they can allocate their data using the system allocator and then
-    pass that pointer into the system and it will register it.
-    I think it should be performant as its nice for iteration and prototyping. At this point in time I dont think we should plan on this 
-    being a "second class" path. It should still work well and all that but shouldn't come at the expense of first class features.
-
-    VERDICT: Implement proposed solution as is
-
-- Should we make loading of resources more explicit? Currently acquire has the potential to load a resource if its not present,
-what if instead we had to make it an explicit process to get the resource by having the user do something like:
-
-    if !resources.load_status() == .NOT_REQUESTED {
-        resources.load_resource()
-    }
-    resources.acquire_handle()
-    Pros: 
-        The system is easier to reason about and you know what can happen where.
-        Our functions become simpler and easier to reason about
-        We can always provide a procedure that has the old behavior, just make it more explicit/clear
-    Cons:
-        non really....
-       
-    Verdict: Implement it
-DONE/IMPLEMENTED
-
-- How should we structure the system such that is fast/not pointer hopping but also not 
-memory inefficient?
-
-- Should we rename this to Resource Store?
-
-- How should things with dependencies calculate their sizes?
-
-*/
-
 ResourceSystem :: struct {
 	serializers:    map[string]ResourceMarshaller,
 	id_to_artifact: map[RsrcId]ResourceArtifact,
-	id_to_loaded:   map[RsrcId]RsrcHandle, //should we point this at the slot instead?
+	id_to_loaded:   map[RsrcId]RsrcHandle,
 	cache:          Cache,
 	sys_allocator:  mem.Allocator,
 	handle_map:     hm.Dynamic_Handle_Map(ResourceSlot, hm.Handle64),
@@ -150,10 +62,10 @@ Describes the status of a resource.
     - ERROR: Resource encountered an error while loading. Callback is dispatched but must handle/react to the error.
 */
 Load_Status :: enum {
-	NOT_REQUESTED,
+	NOT_LOADED,
 	SCHEDULED,
 	IN_PROGRESS,
-	COMPLETED,
+	LOADED,
 	CANCELED,
 	ERROR,
 }
@@ -222,6 +134,7 @@ ResourceArtifact :: struct {
 
 */
 rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
+	//TODO: figure out how to assert random generation is enabled/init.
 	rs.sys_allocator = allocator
 	rs.serializers = make(map[string]ResourceMarshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.sys_allocator)
@@ -344,7 +257,7 @@ handle_acquire_async :: proc(rs: ^ResourceSystem, id: RsrcId, callback: Resource
 		slot, _ := hm.dynamic_get(&rs.handle_map, result)
 		slot.checked_out += 1
 		//TODO: post callback to dispatcher
-		return ResourceFuture{.COMPLETED}
+		return ResourceFuture{.LOADED}
 	}
 
 	panic("handle_acquire_async Unimplemented")
@@ -468,7 +381,12 @@ resource_register :: proc(rs: ^ResourceSystem, to_register: rawptr) -> (RsrcId, 
 
 */
 resource_load_status :: proc(rs: ^ResourceSystem, id: RsrcId) -> Load_Status {
-	panic("TODO: resource_load_status Unimplemented")
+	_, contained := rs.id_to_loaded[id]
+	if contained {
+		return .LOADED
+	} else {
+		panic("TODO: resource_load_status Unimplemented")
+	}
 }
 
 /*
@@ -508,6 +426,7 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 		}
 
 		resource := serializer.create_resource(serializer.user_data, bytes, rs, rs.sys_allocator)
+		assert(resource.data_size_bytes > 0)
 		return add_new_slot(rs, id, resource)
 	case:
 		return handle, error
@@ -529,7 +448,7 @@ read_registry_from_disk :: proc(rs: ^ResourceSystem, file_path: string) -> Resou
 }
 
 
-//--------------------
+//-------CACHE-------------
 
 
 /*
@@ -543,7 +462,7 @@ Requirements:
 
 CacheConfig :: struct {
 	max_size_bytes: u64,
-	evic_strat:     Eviction_Strategy,
+	evict_strat:    Eviction_Strategy,
 }
 
 Eviction_Strategy :: enum {
@@ -570,6 +489,8 @@ Cache :: struct {
 
 cache_init :: proc(c: ^Cache, allocator: mem.Allocator, config: CacheConfig) {
 	c.entry_lookup = make(map[RsrcId]^CacheNode, allocator)
+	c.max_capacity_bytes = config.max_size_bytes
+	c.strategy = config.evict_strat
 }
 
 cache_destroy :: proc(rs: ^ResourceSystem, c: ^Cache) {
@@ -604,13 +525,14 @@ cache_take_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, target_id: RsrcId) 
 }
 
 cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^Cache) {
+	log.info("Current Size", cache.current_size_bytes)
+	log.info("Max Capacity", cache.max_capacity_bytes)
 	for cache.current_size_bytes > cache.max_capacity_bytes && !list.is_empty(&cache.linked_list) {
 		last := cache.linked_list.tail
 		node := container_of(last, CacheNode, "link")
 		removed, _ := cache_take_entry(rs, cache, node.entry.id)
 		handle, _ := rs.id_to_loaded[removed.id]
 		delete_key(&rs.id_to_loaded, removed.id)
-		hm.dynamic_remove(&rs.handle_map, handle)
 		cache.current_size_bytes -= removed.resource.data_size_bytes
 		removed.resource.destructor(removed.resource.data, rs)
 	}
@@ -618,7 +540,6 @@ cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^Cache) {
 
 cache_configure :: proc(rs: ^ResourceSystem, cache: ^Cache, config: CacheConfig) {
 	cache.max_capacity_bytes = config.max_size_bytes
-	cache.strategy = config.evic_strat
-	if (cache.current_size_bytes > cache.max_capacity_bytes) do cache_ensure_limit(rs, cache)
-
+	cache.strategy = config.evict_strat
+	cache_ensure_limit(rs, cache)
 }

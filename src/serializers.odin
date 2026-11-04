@@ -1,6 +1,7 @@
 package main
 import "core:encoding/uuid"
 import "core:fmt"
+import "core:log"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -33,7 +34,7 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 	artifacts := make([]ResourceArtifact, len(split))
 	defer delete(artifacts)
 	for line, i in split {
-		file_path := fmt.aprintf("out%v.txtout", i)
+		file_path := fmt.aprintf("out/out%v.txtout", i)
 		err := os.write_entire_file(file_path, line)
 		artifacts[i] = {
 			id              = uuid.generate_v7_basic(nil),
@@ -50,6 +51,7 @@ txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^Reso
 	str_data := string(file_data)
 	ptr := new(string)
 	ptr^ = str_data
+	log.info("str size", len(file_data))
 	return {ptr, u64(len(file_data)), destroy_resource}
 }
 
