@@ -16,7 +16,7 @@ create_test_rsrc_sys :: proc() -> ^src.ResourceSystem {
 init_rsrc_sys_with_txt_serializer :: proc() -> ^src.ResourceSystem {
 	context.random_generator = crypto.random_generator()
 	rs := create_test_rsrc_sys()
-	src.rsrc_sys_register_serializer(rs, src.default_txt_serializer())
+	src.rsrc_sys_register_marshaller(rs, src.default_txt_serializer())
 	return rs
 }
 
@@ -106,7 +106,7 @@ test_cache_resize :: proc(t: ^testing.T) {
 	//assert that release worked an are no longer referenced
 	iterator := hm.iterator_make(&rs.handle_map)
 	for slot, handle in hm.iterate(&iterator) {
-		testing.expect(t, slot.checked_out == 0)
+		testing.expect(t, slot.ref_count == 0)
 	}
 
 	//test that cache_resize to larger size is non-destructive and that values are set

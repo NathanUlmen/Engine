@@ -54,7 +54,7 @@ txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^Reso
 	str_data := string(file_data)
 	ptr := new(string)
 	ptr^ = str_data
-	log.info("str size", len(file_data))
+	// log.info("str size", len(file_data))
 	return {ptr, u64(len(file_data)), destroy_resource}
 }
 

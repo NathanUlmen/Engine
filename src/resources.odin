@@ -5,9 +5,14 @@ import hm "core:container/handle_map"
 import list "core:container/intrusive/list"
 import "core:encoding/uuid"
 import "core:log"
+import bits "core:math/bits"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
+
+DEFAULT_CACHE_ID :: CacheId(bits.U32_MAX)
+
+DEFAULT_CATEGORY :: CacheCategory{{100 * mem.Megabyte, .LRU}, DEFAULT_CACHE_ID}
 
 CacheId :: distinct u32
 
@@ -17,7 +22,7 @@ CacheCategory :: struct {
 }
 
 ResourceSystem :: struct {
-	serializers:    map[string]ResourceMarshaller,
+	marshallers:    map[string]ResourceMarshaller,
 	id_to_artifact: map[RsrcId]ResourceArtifact,
 	id_to_loaded:   map[RsrcId]RsrcHandle,
 	cache_lookup:   map[CacheId]^Cache,
@@ -45,18 +50,16 @@ RsrcHandle :: hm.Handle64
 Resource :: struct {
 	data:            rawptr,
 	data_size_bytes: u64,
+	//We pass in rs as current resources might have dependencies it needs to free.
 	destructor:      proc(to_free: rawptr, rs: ^ResourceSystem),
-}
-
-ResourceData :: struct {
-	data: rawptr,
 }
 
 ResourceSlot :: struct {
 	using resource: Resource,
 	handle:         RsrcHandle,
 	id:             RsrcId,
-	checked_out:    u32,
+	ref_count:      u32,
+	status:         Load_Status,
 }
 
 /*
@@ -144,11 +147,11 @@ ResourceArtifact :: struct {
 rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 	//TODO: figure out how to assert random generation is enabled/init.
 	rs.sys_allocator = allocator
-	rs.serializers = make(map[string]ResourceMarshaller, rs.sys_allocator)
+	rs.marshallers = make(map[string]ResourceMarshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.sys_allocator)
 	rs.id_to_loaded = make(map[RsrcId]RsrcHandle, rs.sys_allocator)
-	// cache_init(&rs.cache, rs.sys_allocator, {1024, .LRU})
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
+	//TODO: default cache creation and init
 }
 
 /*
@@ -156,10 +159,8 @@ rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 */
 rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
 	hm.dynamic_destroy(&rs.handle_map)
-
-	//TODO: Revist this later. (Maybe add a delete proc to the Serializer ?)
-	// cache_destroy(rs, &rs.cache)
-	for _, serializer in rs.serializers {
+	//TODO: destroy our default cache
+	for _, serializer in rs.marshallers {
 		serializer.destroy_serializer_context(serializer.user_data, rs.sys_allocator)
 	}
 	free_all(rs.sys_allocator)
@@ -170,16 +171,16 @@ rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
     - rs:
     - serializer:
 */
-rsrc_sys_register_serializer :: proc(rs: ^ResourceSystem, serializer: ResourceMarshaller) {
+rsrc_sys_register_marshaller :: proc(rs: ^ResourceSystem, serializer: ResourceMarshaller) {
 	when ODIN_DEBUG {
-		_, contains := rs.serializers[serializer.extension]
+		_, contains := rs.marshallers[serializer.extension]
 		log.warnf("Replaced existing serializer responsible for extension %v", serializer.extension)
 	}
-	to_replace, contained := rs.serializers[serializer.extension]
+	to_replace, contained := rs.marshallers[serializer.extension]
 	if contained {
 		to_replace.destroy_serializer_context(to_replace.user_data, rs.sys_allocator)
 	}
-	rs.serializers[serializer.extension] = serializer
+	rs.marshallers[serializer.extension] = serializer
 }
 
 /*
@@ -191,7 +192,7 @@ Produces resrouce artifact(s) from a target_file
 rsrc_sys_import_file :: proc(rs: ^ResourceSystem, target_file: string) -> Resource_Error {
 	//Retrieve serializer
 	extension := filepath.ext(target_file)
-	serializer, contains := rs.serializers[extension]
+	serializer, contains := rs.marshallers[extension]
 	if !contains {
 		return Resource_Error.Missing_Serializer
 	}
@@ -221,9 +222,17 @@ Acquires a handle to an already loaded resource. If the resource state is not CO
 handle_acquire :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_Error) {
 	target, loaded := rs.id_to_loaded[id]
 	if loaded {
-		slot, valid := hm.dynamic_get(&rs.handle_map, target)
-		if !valid {
-			return {}, .Handle_Error
+		slot, present := hm.get(&rs.handle_map, target)
+		if !present {
+			//check cache	
+			artifcat, _ := rs.id_to_artifact[id]
+			cache, err := ensure_cache(rs, artifcat)
+			entry, contained := cache_take_entry(rs, cache, id)
+			if contained {
+				return add_new_slot(rs, id, entry.resource)
+			} else {
+				return {}, .Handle_Error
+			}
 		}
 		return duplicate_handle(rs, slot.handle)
 	}
@@ -233,16 +242,14 @@ handle_acquire :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource
 @(private)
 add_new_slot :: proc(rs: ^ResourceSystem, id: RsrcId, resource: Resource) -> (RsrcHandle, Resource_Error) {
 	slot: ResourceSlot = {
-		resource    = resource,
-		checked_out = 1,
-		id          = id,
+		resource  = resource,
+		ref_count = 1,
+		id        = id,
 	}
-	ptr := &slot
-	handle, alloc_err := hm.dynamic_add(&rs.handle_map, slot)
-	if alloc_err != nil {
-		return {}, .Allocator_Error
-	}
-	added_slot, _ := hm.dynamic_get(&rs.handle_map, handle)
+	handle, alloc_err := hm.add(&rs.handle_map, slot)
+	assert(alloc_err == nil)
+
+	added_slot, _ := hm.get(&rs.handle_map, handle)
 	rs.id_to_loaded[id] = handle
 	added_slot.handle = handle
 	return handle, .None
@@ -262,8 +269,8 @@ the callback is sent to the dispatcher immediately.
 handle_acquire_async :: proc(rs: ^ResourceSystem, id: RsrcId, callback: ResourceCallback, cb_dispatcher: Dispatcher) -> ResourceFuture {
 	result, contained := rs.id_to_loaded[id]
 	if contained {
-		slot, _ := hm.dynamic_get(&rs.handle_map, result)
-		slot.checked_out += 1
+		slot, _ := hm.get(&rs.handle_map, result)
+		slot.ref_count += 1
 		//TODO: post callback to dispatcher
 		return ResourceFuture{.LOADED}
 	}
@@ -283,21 +290,20 @@ handle_batch_acquire_async :: proc(rs: ^ResourceSystem) -> ResourceFuture {
 
 */
 release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Error {
-	slot, ok := hm.dynamic_get(&rs.handle_map, handle)
+	slot, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return .Handle_Error
 	}
 
-	slot.checked_out -= 1
-	if slot.checked_out == 0xFFFFFFFF {
-		return .Handle_Error
+	slot.ref_count -= 1
+	if slot.ref_count == bits.U32_MAX {
+		panic("release_handle: Multiple invalid frees have occured")
 	}
 
-	if slot.checked_out == 0 {
-		hm.dynamic_remove(&rs.handle_map, handle)
+	if slot.ref_count == 0 {
+		hm.remove(&rs.handle_map, handle)
 		artifact, contains := rs.id_to_artifact[slot.id]
-		assert(contains)
-		cache, err := ensure_cache_artifact(rs, artifact)
+		cache, err := ensure_cache(rs, artifact)
 		assert(err == .None)
 		cache_add_entry(rs, cache, {slot.id, slot^})
 	}
@@ -314,7 +320,7 @@ Resolves/dereferrences what ever the resource handle points to, this is used to 
 */
 handle_resolve :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> (rawptr, Resource_Error) {
 	hanlde := hm.Handle64{}
-	result, ok := hm.dynamic_get(&rs.handle_map, handle)
+	result, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return nil, .Handle_Error
 	}
@@ -354,11 +360,11 @@ Copies a handle to a given resource and preserves reference counting
     - a copied resource handle that is reference counted
 */
 duplicate_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> (RsrcHandle, Resource_Error) {
-	result, ok := hm.dynamic_get(&rs.handle_map, handle)
+	result, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return {}, .Handle_Error
 	}
-	result.checked_out += 1
+	result.ref_count += 1
 	return handle, .None
 }
 
@@ -433,18 +439,17 @@ load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_
 		}
 
 		//retrieve serializer
-		serializer, ok := rs.serializers[artifact._extension]
+		serializer, ok := rs.marshallers[artifact._extension]
 		if !ok {
 			return {}, .Missing_Serializer
 		}
 
 		bytes, read_err := os.read_entire_file(artifact.baked_file_path, rs.sys_allocator)
-		if read_err != nil {
-			//TODO: return an error that matches read file error
-		}
+		assert(read_err == nil)
 
 		resource := serializer.create_resource(serializer.user_data, bytes, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0)
+
 		return add_new_slot(rs, id, resource)
 	case:
 		return handle, error
@@ -527,10 +532,10 @@ Cache :: struct {
 	linked_list:        list.List,
 }
 
-cache_init :: proc(c: ^Cache, allocator: mem.Allocator, config: CacheConfig) {
-	c.entry_lookup = make(map[RsrcId]^CacheNode, allocator)
-	c.max_capacity_bytes = config.max_size_bytes
-	c.strategy = config.evict_strat
+cache_init :: proc(cache: ^Cache, allocator: mem.Allocator, config: CacheConfig) {
+	cache.entry_lookup = make(map[RsrcId]^CacheNode, allocator)
+	cache.max_capacity_bytes = config.max_size_bytes
+	cache.strategy = config.evict_strat
 }
 
 cache_destroy :: proc(rs: ^ResourceSystem, c: ^Cache) {
@@ -565,8 +570,6 @@ cache_take_entry :: proc(rs: ^ResourceSystem, cache: ^Cache, target_id: RsrcId) 
 }
 
 cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^Cache) {
-	log.info("Current Size", cache.current_size_bytes)
-	log.info("Max Capacity", cache.max_capacity_bytes)
 	for cache.current_size_bytes > cache.max_capacity_bytes && !list.is_empty(&cache.linked_list) {
 		last := cache.linked_list.tail
 		node := container_of(last, CacheNode, "link")
