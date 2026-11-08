@@ -7,13 +7,13 @@ import "core:os"
 import "core:strings"
 import "core:testing"
 
-create_test_rsrc_sys :: proc() -> ^src.ResourceSystem {
-	rs := new(src.ResourceSystem)
+create_test_rsrc_sys :: proc() -> ^src.Resource_Store {
+	rs := new(src.Resource_Store)
 	src.rsrc_sys_init(rs, context.allocator)
 	return rs
 }
 
-init_rsrc_sys_with_txt_serializer :: proc() -> ^src.ResourceSystem {
+init_rsrc_sys_with_txt_serializer :: proc() -> ^src.Resource_Store {
 	context.random_generator = crypto.random_generator()
 	rs := create_test_rsrc_sys()
 	src.rsrc_sys_register_marshaller(rs, src.default_txt_serializer())

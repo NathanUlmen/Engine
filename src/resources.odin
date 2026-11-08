@@ -10,24 +10,24 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 
-DEFAULT_CACHE_ID :: CacheId(bits.U32_MAX)
+DEFAULT_CACHE_ID :: Cache_Id(bits.U32_MAX)
 
-DEFAULT_CATEGORY :: CacheCategory{100 * mem.Megabyte, DEFAULT_CACHE_ID}
+DEFAULT_CATEGORY :: Cache_Category{100 * mem.Megabyte, DEFAULT_CACHE_ID}
 
-CacheId :: distinct u32
+Cache_Id :: distinct u32
 
-CacheCategory :: struct {
+Cache_Category :: struct {
 	max_size_bytes: u64,
-	category_id:    CacheId,
+	category_id:    Cache_Id,
 }
 
-ResourceSystem :: struct {
-	marshallers:    map[string]ResourceMarshaller,
-	id_to_artifact: map[RsrcId]ResourceArtifact,
-	id_to_loaded:   map[RsrcId]RsrcHandle,
-	cache_lookup:   map[CacheId]CacheLRU,
+Resource_Store :: struct {
+	marshallers:    map[string]Resource_Marshaller,
+	id_to_artifact: map[Rsrc_Id]Resource_Artifact,
+	id_to_loaded:   map[Rsrc_Id]Rsrc_Handle,
+	cache_lookup:   map[Cache_Id]CacheLRU,
 	sys_allocator:  mem.Allocator,
-	handle_map:     hm.Dynamic_Handle_Map(ResourceSlot, hm.Handle64),
+	handle_map:     hm.Dynamic_Handle_Map(Resource_Slot, hm.Handle64),
 }
 
 Resource_Error :: enum {
@@ -43,21 +43,25 @@ Resource_Error :: enum {
 	Missing_File,
 }
 
-RsrcId :: uuid.Identifier
+Rsrc_Id :: uuid.Identifier
 
-RsrcHandle :: hm.Handle64
+Rsrc_Handle :: hm.Handle64
+
+RsHandle :: struct($T: typeid) {
+	handle: ResourceHandle,
+}
 
 Resource :: struct {
 	data:            rawptr,
 	data_size_bytes: u64,
 	//We pass in rs as current resources might have dependencies it needs to free.
-	destructor:      proc(to_free: rawptr, rs: ^ResourceSystem),
+	destructor:      proc(to_free: rawptr, rs: ^Resource_Store),
 }
 
-ResourceSlot :: struct {
+Resource_Slot :: struct {
 	using resource: Resource,
-	handle:         RsrcHandle,
-	id:             RsrcId,
+	handle:         Rsrc_Handle,
+	id:             Rsrc_Id,
 	ref_count:      u32,
 	status:         Load_Status,
 
@@ -87,7 +91,7 @@ Load_Status :: enum {
 A future to a resource that is being acquired asynchronously.
 
 */
-ResourceFuture :: struct {
+Resource_Future :: struct {
 	status: Load_Status,
 }
 
@@ -95,12 +99,12 @@ Dispatcher :: struct {
 	post: proc(runnable: proc()),
 }
 
-ResourceCallback :: struct {
+Resource_Callback :: struct {
 	user_data: rawptr,
-	cb:        proc(user_data: rawptr, handle: RsrcHandle),
+	cb:        proc(user_data: rawptr, handle: Rsrc_Handle),
 }
 
-MarshallerContext :: struct {
+Marshaller_Context :: struct {
 	user_data:                  rawptr,
 	destroy_serializer_context: proc(user_data: rawptr, allocator: mem.Allocator),
 }
@@ -114,11 +118,11 @@ An "interface" used by the ResourceSystem.
     - hydrate_resource: procedure that is responsible for transforming the file bytes of the artifact into useful data.
     - destroy_resource: destroy a resource created by this serializer.
 */
-ResourceMarshaller :: struct {
-	using serializer_context: MarshallerContext,
+Resource_Marshaller :: struct {
+	using serializer_context: Marshaller_Context,
 	extension:                string,
-	import_resource:          proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> (a: []ResourceArtifact, ok: bool),
-	create_resource:          proc(user_data: rawptr, file_path: string, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> Resource,
+	import_resource:          proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> (a: []Resource_Artifact, ok: bool),
+	create_resource:          proc(user_data: rawptr, file_path: string, rsrc_sys: ^Resource_Store, allocator: mem.Allocator) -> Resource,
 }
 
 /*
@@ -132,10 +136,10 @@ ResourceMarshaller :: struct {
     - import_version: uhhh
 
 */
-ResourceArtifact :: struct {
-	id:                   RsrcId, //maybe we can handle this for the user?
-	cache_category:       CacheCategory,
-	dependencies:         []RsrcId,
+Resource_Artifact :: struct {
+	id:                   Rsrc_Id, //maybe we can handle this for the user?
+	cache_category:       Cache_Category,
+	dependencies:         []Rsrc_Id,
 	type:                 string,
 	baked_file_path:      string,
 	name:                 string,
@@ -147,13 +151,13 @@ ResourceArtifact :: struct {
 /*
 
 */
-rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
+rsrc_sys_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator) {
 	//TODO: figure out how to assert random generation is enabled/init.
 	rs.sys_allocator = allocator
-	rs.marshallers = make(map[string]ResourceMarshaller, rs.sys_allocator)
-	rs.id_to_artifact = make(map[RsrcId]ResourceArtifact, rs.sys_allocator)
-	rs.id_to_loaded = make(map[RsrcId]RsrcHandle, rs.sys_allocator)
-	rs.cache_lookup = make(map[CacheId]CacheLRU)
+	rs.marshallers = make(map[string]Resource_Marshaller, rs.sys_allocator)
+	rs.id_to_artifact = make(map[Rsrc_Id]Resource_Artifact, rs.sys_allocator)
+	rs.id_to_loaded = make(map[Rsrc_Id]Rsrc_Handle, rs.sys_allocator)
+	rs.cache_lookup = make(map[Cache_Id]CacheLRU)
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 	//TODO: default cache creation and init
 }
@@ -161,7 +165,7 @@ rsrc_sys_init :: proc(rs: ^ResourceSystem, allocator: mem.Allocator) {
 /*
 
 */
-rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
+rsrc_sys_destroy :: proc(rs: ^Resource_Store) {
 	context.allocator = rs.sys_allocator
 	iterator := hm.iterator_make(&rs.handle_map)
 	for slot, handle in hm.iterate(&iterator) {
@@ -185,7 +189,7 @@ rsrc_sys_destroy :: proc(rs: ^ResourceSystem) {
 	// free_all(rs.sys_allocator)
 }
 
-artifact_destroy :: proc(artifact: ^ResourceArtifact) {
+artifact_destroy :: proc(artifact: ^Resource_Artifact) {
 }
 
 /*
@@ -193,7 +197,7 @@ artifact_destroy :: proc(artifact: ^ResourceArtifact) {
     - rs:
     - serializer:
 */
-rsrc_sys_register_marshaller :: proc(rs: ^ResourceSystem, serializer: ResourceMarshaller) {
+rsrc_sys_register_marshaller :: proc(rs: ^Resource_Store, serializer: Resource_Marshaller) {
 	when ODIN_DEBUG {
 		_, contains := rs.marshallers[serializer.extension]
 		log.warnf("Replaced existing serializer responsible for extension %v", serializer.extension)
@@ -211,7 +215,7 @@ Produces resrouce artifact(s) from a target_file
     - rs:
     - target_file:
 */
-rsrc_sys_import_file :: proc(rs: ^ResourceSystem, target_file: string) -> Resource_Error {
+rsrc_sys_import_file :: proc(rs: ^Resource_Store, target_file: string) -> Resource_Error {
 	//Retrieve serializer
 	extension := filepath.ext(target_file)
 	serializer, contains := rs.marshallers[extension]
@@ -241,7 +245,7 @@ Acquires a handle to an already loaded resource. If the resource state is not LO
     - ResourceHandle: A handle to the resource.
     - Resource_Error: 
 */
-handle_acquire :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_Error) {
+handle_acquire :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Handle, Resource_Error) {
 	handle := rs.id_to_loaded[id]
 	target_slot, contained := hm.get(&rs.handle_map, handle)
 	if contained && target_slot.status == .LOADED {
@@ -259,8 +263,8 @@ handle_acquire :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource
 }
 
 @(private)
-add_new_slot :: proc(rs: ^ResourceSystem, id: RsrcId, resource: Resource) -> (RsrcHandle, Resource_Error) {
-	slot: ResourceSlot = {
+add_new_slot :: proc(rs: ^Resource_Store, id: Rsrc_Id, resource: Resource) -> (Rsrc_Handle, Resource_Error) {
+	slot: Resource_Slot = {
 		resource  = resource,
 		ref_count = 1,
 		id        = id,
@@ -285,13 +289,13 @@ the callback is sent to the dispatcher immediately.
     - callback: the procedure to execute once the resource has been acquired.
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
-handle_acquire_async :: proc(rs: ^ResourceSystem, id: RsrcId, callback: ResourceCallback, cb_dispatcher: Dispatcher) -> ResourceFuture {
+handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback, cb_dispatcher: Dispatcher) -> Resource_Future {
 	handle := rs.id_to_loaded[id]
 	slot, contained := hm.get(&rs.handle_map, handle)
 	if contained {
 		slot.ref_count += 1
 		//TODO: post callback to dispatcher
-		return ResourceFuture{.LOADED}
+		return Resource_Future{.LOADED}
 	}
 
 	panic("handle_acquire_async Unimplemented")
@@ -300,7 +304,7 @@ handle_acquire_async :: proc(rs: ^ResourceSystem, id: RsrcId, callback: Resource
 /*
 
 */
-handle_batch_acquire_async :: proc(rs: ^ResourceSystem) -> ResourceFuture {
+handle_batch_acquire_async :: proc(rs: ^Resource_Store) -> Resource_Future {
 	panic("handle_batch_acquire_async Unimplemented")
 }
 
@@ -308,7 +312,7 @@ handle_batch_acquire_async :: proc(rs: ^ResourceSystem) -> ResourceFuture {
 
 
 */
-release_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> Resource_Error {
+release_handle :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> Resource_Error {
 	slot, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return .Handle_Error
@@ -335,7 +339,7 @@ Resolves/dereferrences what ever the resource handle points to, this is used to 
     Returns:
     - rawptr: pointer to the actual data stored inside the system
 */
-handle_resolve :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> (rawptr, Resource_Error) {
+handle_resolve :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> (rawptr, Resource_Error) {
 	result, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return nil, .Handle_Error
@@ -360,11 +364,11 @@ resource_shallow_copy :: proc {
 	resource_shallow_copy_on_id,
 }
 
-resource_shallow_copy_on_id :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcId, RsrcHandle) {
+resource_shallow_copy_on_id :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Id, Rsrc_Handle) {
 	panic("TODO: resource_shallow_copy_on_id Unimplemented")
 }
 
-resource_shallow_copy_on_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> (RsrcId, RsrcHandle) {
+resource_shallow_copy_on_handle :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> (Rsrc_Id, Rsrc_Handle) {
 	panic("TODO: resource_shallow_copy_on_handle Unimplemented")
 }
 
@@ -377,7 +381,7 @@ Copies a handle to a given resource and preserves reference counting
     Returns:
     - a copied resource handle that is reference counted
 */
-duplicate_handle :: proc(rs: ^ResourceSystem, handle: RsrcHandle) -> (RsrcHandle, Resource_Error) {
+duplicate_handle :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> (Rsrc_Handle, Resource_Error) {
 	result, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return {}, .Handle_Error
@@ -395,7 +399,7 @@ It's probably a good idea to free the original after calling this procedure.
     Returns:
     - the id to this handle
 */
-copy_resource_into_registry :: proc(rs: ^ResourceSystem, to_register: rawptr, cache_category: CacheCategory) -> (RsrcId, RsrcHandle, Resource_Error) {
+copy_resource_into_registry :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category) -> (Rsrc_Id, Rsrc_Handle, Resource_Error) {
 	panic("TODO: copy_resource_into_registry is Unimplemented")
 }
 
@@ -409,14 +413,14 @@ Assumes that the resource to be registered was allocated with the same allocator
     - Handle to the registered resource
     - Error status
 */
-resource_register :: proc(rs: ^ResourceSystem, to_register: rawptr, cache_category: CacheCategory) -> (RsrcId, RsrcHandle, Resource_Error) {
+resource_register :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category) -> (Rsrc_Id, Rsrc_Handle, Resource_Error) {
 	panic("TODO: resource_register is Unimplemented")
 }
 
 /*
 
 */
-resource_load_status :: proc(rs: ^ResourceSystem, id: RsrcId) -> Load_Status {
+resource_load_status :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> Load_Status {
 	_, contained := rs.id_to_loaded[id]
 	if contained {
 		return .LOADED
@@ -435,7 +439,7 @@ loaded you will recieve a hanlde to it
     - RsrcHandle:
     - Resource_Error:
 */
-load_resource :: proc(rs: ^ResourceSystem, id: RsrcId) -> (RsrcHandle, Resource_Error) {
+load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Handle, Resource_Error) {
 	handle, error := handle_acquire(rs, id)
 	#partial switch error {
 	case .Not_Loaded:
@@ -467,12 +471,12 @@ ensure_cache :: proc {
 }
 
 @(private)
-ensure_cache_artifact :: proc(rs: ^ResourceSystem, artifact: ResourceArtifact) -> (^CacheLRU, Resource_Error) {
+ensure_cache_artifact :: proc(rs: ^Resource_Store, artifact: Resource_Artifact) -> (^CacheLRU, Resource_Error) {
 	return ensure_cache_id(rs, artifact.cache_category.category_id, artifact.cache_category.max_size_bytes)
 }
 
 @(private)
-ensure_cache_id :: proc(rs: ^ResourceSystem, category_id: CacheId, cache_max_size_bytes: u64) -> (^CacheLRU, Resource_Error) {
+ensure_cache_id :: proc(rs: ^Resource_Store, category_id: Cache_Id, cache_max_size_bytes: u64) -> (^CacheLRU, Resource_Error) {
 	cache, cache_contained := &rs.cache_lookup[category_id]
 	if !cache_contained {
 		c := CacheLRU{}
@@ -486,14 +490,14 @@ ensure_cache_id :: proc(rs: ^ResourceSystem, category_id: CacheId, cache_max_siz
 /*
 
 */
-write_registry_to_disk :: proc(rs: ResourceSystem, output_path: string) -> Resource_Error {
+write_registry_to_disk :: proc(rs: Resource_Store, output_path: string) -> Resource_Error {
 	panic("TODO write_registry_to_disk Unimplemented")
 }
 
 /*
 
 */
-read_registry_from_disk :: proc(rs: ^ResourceSystem, file_path: string) -> Resource_Error {
+read_registry_from_disk :: proc(rs: ^Resource_Store, file_path: string) -> Resource_Error {
 	panic("TODO read_reg_from_disk Unimplemented")
 }
 
@@ -519,22 +523,22 @@ cache_init :: proc(cache: ^CacheLRU, max_size_bytes: u64) {
 	cache.current_size_bytes = 0
 }
 
-cache_add_entry :: proc(rs: ^ResourceSystem, cache: ^CacheLRU, slot: ^ResourceSlot) {
+cache_add_entry :: proc(rs: ^Resource_Store, cache: ^CacheLRU, slot: ^Resource_Slot) {
 	cache.current_size_bytes += slot.data_size_bytes
 	list.push_front(&cache.linked_list, &slot.node)
 	cache_ensure_limit(rs, cache)
 }
 
-cache_take_entry :: proc(rs: ^ResourceSystem, cache: ^CacheLRU, slot: ^ResourceSlot) {
+cache_take_entry :: proc(rs: ^Resource_Store, cache: ^CacheLRU, slot: ^Resource_Slot) {
 	cache.current_size_bytes -= slot.data_size_bytes
 	list.remove(&cache.linked_list, &slot.node)
 }
 
-cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^CacheLRU) {
+cache_ensure_limit :: proc(rs: ^Resource_Store, cache: ^CacheLRU) {
 	for cache.current_size_bytes > cache.max_capacity_bytes {
 		removed_node := list.pop_back(&cache.linked_list)
 		assert(removed_node != nil)
-		removed_slot := container_of(removed_node, ResourceSlot, "node")
+		removed_slot := container_of(removed_node, Resource_Slot, "node")
 		removed_slot.resource.destructor(removed_slot.data, rs)
 		cache.current_size_bytes -= removed_slot.data_size_bytes
 		hm.remove(&rs.handle_map, removed_slot.handle)
@@ -542,7 +546,7 @@ cache_ensure_limit :: proc(rs: ^ResourceSystem, cache: ^CacheLRU) {
 	}
 }
 
-cache_configure :: proc(rs: ^ResourceSystem, cache_id: CacheId, max_size_bytes: u64) {
+cache_configure :: proc(rs: ^Resource_Store, cache_id: Cache_Id, max_size_bytes: u64) {
 	cache, _ := &rs.cache_lookup[cache_id]
 	cache.max_capacity_bytes = max_size_bytes
 	cache_ensure_limit(rs, cache)

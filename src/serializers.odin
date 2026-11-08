@@ -6,9 +6,9 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 
-TEXT_CACHE_CATEGORY :: CacheId(0)
+TEXT_CACHE_CATEGORY :: Cache_Id(0)
 
-default_txt_serializer :: proc() -> ResourceMarshaller {
+default_txt_serializer :: proc() -> Resource_Marshaller {
 	return {{nil, context_destructor}, ".txt", txt_bake_to_disk, txt_read_from_disk}
 }
 
@@ -24,7 +24,7 @@ txt_extract :: proc(user_data: rawptr, file_path: string) -> (rawptr, Resource_E
 	return rawptr(stored), .None
 }
 
-txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> ([]ResourceArtifact, bool) {
+txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> ([]Resource_Artifact, bool) {
 	file_bytes, _ := os.read_entire_file(file_path, allocator)
 	str_data := string(file_bytes)
 	defer {
@@ -33,7 +33,7 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 
 	split, err := strings.split_lines(str_data)
 	defer delete(split)
-	artifacts := make([]ResourceArtifact, len(split))
+	artifacts := make([]Resource_Artifact, len(split))
 	defer delete(artifacts)
 	for line, i in split {
 		file_path := fmt.aprintf("out/out%v.txtout", i)
@@ -50,7 +50,7 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 	return artifacts, true
 }
 
-txt_read_from_disk :: proc(user_data: rawptr, file_path: string, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> Resource {
+txt_read_from_disk :: proc(user_data: rawptr, file_path: string, rsrc_sys: ^Resource_Store, allocator: mem.Allocator) -> Resource {
 	file_data, _ := os.read_entire_file(file_path, allocator)
 	defer delete(file_data)
 
@@ -61,7 +61,7 @@ txt_read_from_disk :: proc(user_data: rawptr, file_path: string, rsrc_sys: ^Reso
 	return {ptr, u64(len(file_data)), destroy_resource}
 }
 
-destroy_resource :: proc(to_free: rawptr, rsrc_sys: ^ResourceSystem) {
+destroy_resource :: proc(to_free: rawptr, rsrc_sys: ^Resource_Store) {
 	free(to_free)
 }
 
