@@ -60,7 +60,7 @@ txt_read_from_disk :: proc(user_data: rawptr, file_path: string, rsrc_sys: ^Reso
 	ptr := new(string)
 	ptr^ = str_data
 	// log.info("str size", len(file_data))
-	return {ptr, u64(len(file_data)), destroy_resource}
+	return {string, ptr, u64(len(file_data)), destroy_resource}
 }
 
 destroy_resource :: proc(to_free: rawptr, rsrc_sys: ^Resource_Store) {

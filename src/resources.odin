@@ -40,6 +40,7 @@ Resource_Error :: enum {
 	Missing_Artifact,
 	Serialization_Error,
 	Missing_File,
+	Type_Missmatch,
 }
 
 Rsrc_Id :: uuid.Identifier
@@ -49,6 +50,7 @@ Rs_Handle :: struct($T: typeid) {
 }
 
 Resource :: struct {
+	type:            typeid,
 	data:            rawptr,
 	data_size_bytes: u64,
 	//We pass in rs as current resources might have dependencies it needs to free.
@@ -280,14 +282,14 @@ add_new_slot :: proc(rs: ^Resource_Store, id: Rsrc_Id, resource: Resource, $T: t
 Acquires a handle to a resource in an asynchronous manner. If the requested resource is not 
 yet loaded it is loaded asynchronously. Once the resource is loaded into Memory the callback
 is sent to the dispatcher where it can then be fired. If the requested resource is already in memory 
-the callback is sent to the dispatcher immediately.
+the callback is sent to the dispatcher immediately. The user must 
     Inputs:
     - rs: the ResourceSystem to 
     - id: The stable id to the resource you wish to read from memory.
     - callback: the procedure to execute once the resource has been acquired.
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
-handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback(any), cb_dispatcher: Dispatcher) -> Resource_Future {
+handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback($T), cb_dispatcher: Dispatcher) -> Resource_Future {
 	handle := rs.id_to_loaded[id]
 	slot, contained := hm.get(&rs.handle_map, handle)
 	if contained {
@@ -338,13 +340,17 @@ Resolves/dereferrences what ever the resource handle points to, this is used to 
     - rawptr: pointer to the actual data stored inside the system
 */
 handle_resolve :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (^T, Resource_Error) {
-	result, ok := hm.get(&rs.handle_map, handle.handle)
+	slot, ok := hm.get(&rs.handle_map, handle.handle)
 	if !ok {
 		return nil, .Handle_Error
 	}
-	assert(result.ref_count > 0, "You are resolving a handle that you already freed or improperly duplicated!!")
+	assert(slot.ref_count > 0, "You are resolving a handle that you already freed or improperly duplicated!!")
 
-	return cast(^T)result.data, .None
+	if slot.type != T {
+		return nil, .Type_Missmatch
+	}
+
+	return cast(^T)slot.data, .None
 }
 
 /*
@@ -397,7 +403,7 @@ It's probably a good idea to free the original after calling this procedure.
     Returns:
     - the id to this handle
 */
-copy_resource_into_registry :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category, $T: typeid) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
+copy_resource_into_registry :: proc(rs: ^Resource_Store, to_register: ^$T, cache_category: Cache_Category) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
 	panic("TODO: copy_resource_into_registry is Unimplemented")
 }
 
@@ -411,7 +417,7 @@ Assumes that the resource to be registered was allocated with the same allocator
     - Handle to the registered resource
     - Error status
 */
-resource_register :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category, $T: typeid) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
+resource_register :: proc(rs: ^Resource_Store, to_register: ^$T, cache_category: Cache_Category) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
 	panic("TODO: resource_register is Unimplemented")
 }
 
@@ -455,6 +461,8 @@ load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id, $T: typeid) -> (Rs_Handl
 
 		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
+		//TODO: return an error for this later on once we polish everything up
+		assert(T == resource.type, "Expected resource type does not match returned type!")
 
 		return add_new_slot(rs, id, resource, T)
 	case:

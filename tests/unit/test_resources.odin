@@ -39,14 +39,14 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 
 		//resolve out handle and get the data.
 		data, e := src.handle_resolve(rs, handle)
-		log.info(data)
+		log.info(data^)
 		testing.expect(t, e == .None)
 		testing.expect(t, data != nil)
 
 		//verify our data is correct
 		found := false
 		for s in string_data {
-			if s == (cast(^string)data)^ {
+			if s == data^ {
 				found = true
 				break
 			}
