@@ -3,6 +3,8 @@ package main
 import hm "core:container/handle_map"
 import list "core:container/intrusive/list"
 import "core:encoding/uuid"
+import "core:fmt"
+_ :: fmt
 import "core:log"
 _ :: log
 import bits "core:math/bits"
@@ -462,7 +464,7 @@ load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id, $T: typeid) -> (Rs_Handl
 		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
 		//TODO: return an error for this later on once we polish everything up
-		assert(T == resource.type, "Expected resource type does not match returned type!")
+		assert(T == resource.type, fmt.aprintf("Providied resource type of %v does not match returned type %v", typeid_of(T), resource.type))
 
 		return add_new_slot(rs, id, resource, T)
 	case:

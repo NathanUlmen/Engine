@@ -86,6 +86,28 @@ test_invalid_id :: proc(t: ^testing.T) {}
 test_missing_serializer :: proc(t: ^testing.T) {}
 
 @(test)
+test_type_validation :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rsrc_sys_with_txt_serializer()
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+	}
+
+	err := src.rsrc_sys_import_file(rs, "testData.txt")
+	testing.expect(t, err == .None)
+
+	for id, _ in rs.id_to_artifact {
+		testing.expect_assert(t, "Providied resource type of bool does not match returned type string")
+		bad_handle, _ := src.load_resource(rs, id, bool)
+		testing.expect(t, bad_handle == {})
+
+		handle, _ := src.load_resource(rs, id, string)
+		testing.expect(t, handle != {})
+	}
+}
+
+@(test)
 test_cache_resize :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
 	rs := init_rsrc_sys_with_txt_serializer()
