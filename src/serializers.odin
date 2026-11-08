@@ -40,7 +40,7 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 		err := os.write_entire_file(file_path, line)
 		artifacts[i] = {
 			id              = uuid.generate_v7_basic(nil),
-			cache_category  = {{1024, .LRU}, TEXT_CACHE_CATEGORY},
+			cache_category  = {1024, TEXT_CACHE_CATEGORY},
 			dependencies    = nil,
 			baked_file_path = file_path,
 			name            = file_path,
@@ -50,7 +50,10 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 	return artifacts, true
 }
 
-txt_read_from_disk :: proc(user_data: rawptr, file_data: []byte, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> Resource {
+txt_read_from_disk :: proc(user_data: rawptr, file_path: string, rsrc_sys: ^ResourceSystem, allocator: mem.Allocator) -> Resource {
+	file_data, _ := os.read_entire_file(file_path, allocator)
+	defer delete(file_data)
+
 	str_data := string(file_data)
 	ptr := new(string)
 	ptr^ = str_data
@@ -63,5 +66,5 @@ destroy_resource :: proc(to_free: rawptr, rsrc_sys: ^ResourceSystem) {
 }
 
 context_destructor :: proc(data: rawptr, allocator: mem.Allocator) {
-
+	free(data)
 }

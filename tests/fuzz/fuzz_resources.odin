@@ -16,7 +16,7 @@ test :: proc() {
 	rand.reset(SEED)
 	rs := create_resource_store()
 	defer src.rsrc_sys_destroy(rs)
-	src.rsrc_sys_register_serializer(rs, src.default_txt_serializer())
+	src.rsrc_sys_register_marshaller(rs, src.default_txt_serializer())
 
 	release_acquire_seed := rand.int31()
 

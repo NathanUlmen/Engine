@@ -28,6 +28,7 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 	defer src.rsrc_sys_destroy(rs)
 	file_bytes, _ := os.read_entire_file("testData.txt", context.allocator)
 	defer delete(file_bytes)
+	defer free(rs)
 
 
 	string_data := strings.split_lines(string(file_bytes))
@@ -65,6 +66,7 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 test_invalid_free :: proc(t: ^testing.T) {
 	rs := init_rsrc_sys_with_txt_serializer()
 	src.rsrc_sys_destroy(rs)
+	free(rs)
 }
 
 test_acquire_loaded_resource :: proc(t: ^testing.T) {
@@ -112,13 +114,13 @@ test_cache_resize :: proc(t: ^testing.T) {
 	//test that cache_resize to larger size is non-destructive and that values are set
 	old_size := rs.cache_lookup[src.TEXT_CACHE_CATEGORY].current_size_bytes
 	old_loaded := len(rs.id_to_loaded)
-	src.cache_configure(rs, 0, {2048, .LRU})
+	src.cache_configure(rs, 0, 2048)
 	testing.expect(t, rs.cache_lookup[src.TEXT_CACHE_CATEGORY].current_size_bytes == old_size)
 	testing.expect(t, rs.cache_lookup[src.TEXT_CACHE_CATEGORY].max_capacity_bytes == 2048)
 	testing.expect(t, len(rs.id_to_loaded) == old_loaded)
 
 	//assert that a cache-resize to zero evicts all entries
-	src.cache_configure(rs, src.TEXT_CACHE_CATEGORY, {0, .LRU})
+	src.cache_configure(rs, src.TEXT_CACHE_CATEGORY, 0)
 
 	//assert that items were deleted.
 	testing.expect(t, len(rs.id_to_loaded) == 0)
