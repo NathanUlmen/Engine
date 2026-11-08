@@ -1,13 +1,12 @@
 package main
 
-import "base:runtime"
 import hm "core:container/handle_map"
 import list "core:container/intrusive/list"
 import "core:encoding/uuid"
 import "core:log"
+_ :: log
 import bits "core:math/bits"
 import "core:mem"
-import "core:os"
 import "core:path/filepath"
 
 DEFAULT_CACHE_ID :: Cache_Id(bits.U32_MAX)
@@ -168,7 +167,7 @@ rsrc_sys_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator) {
 rsrc_sys_destroy :: proc(rs: ^Resource_Store) {
 	context.allocator = rs.sys_allocator
 	iterator := hm.iterator_make(&rs.handle_map)
-	for slot, handle in hm.iterate(&iterator) {
+	for slot, _ in hm.iterate(&iterator) {
 		slot.resource.destructor(slot.data, rs)
 	}
 
@@ -199,8 +198,9 @@ artifact_destroy :: proc(artifact: ^Resource_Artifact) {
 */
 rsrc_sys_register_marshaller :: proc(rs: ^Resource_Store, serializer: Resource_Marshaller) {
 	when ODIN_DEBUG {
-		_, contains := rs.marshallers[serializer.extension]
-		log.warnf("Replaced existing serializer responsible for extension %v", serializer.extension)
+		if _, contains := rs.marshallers[serializer.extension]; contains {
+			log.warnf("Replaced existing serializer responsible for extension %v", serializer.extension)
+		}
 	}
 	to_replace, contained := rs.marshallers[serializer.extension]
 	if contained {
@@ -323,7 +323,7 @@ release_handle :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> Resource_Err
 
 	//give ownership to the cache
 	if slot.ref_count == 0 {
-		artifact, contains := rs.id_to_artifact[slot.id]
+		artifact := rs.id_to_artifact[slot.id]
 		cache, err := ensure_cache(rs, artifact)
 		assert(err == .None)
 		cache_add_entry(rs, cache, slot)

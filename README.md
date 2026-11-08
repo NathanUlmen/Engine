@@ -6,22 +6,23 @@ In progress.
 
 ## Compiling and Running
 
-In order build and run you need Odin installed and setup.
+In order to build and run you need Odin installed and setup. For instructions on how to do this [click here](https://odin-lang.org/docs/install/).
 
 To run:
 ```bash
-odin run src/ 
+odin run src/
 ```
 
 To build:
 
 ```bash
-odin build -o:speed -microarch=native src/ 
+make build
 ```
 
 To test:
 ```bash
-odin test tests/ 
+make test
 ```
 
 ## Project Structure
+

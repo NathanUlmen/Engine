@@ -2,6 +2,7 @@ package main
 
 import "core:log"
 import "core:mem"
+_ :: mem
 import "core:os"
 
 
@@ -37,6 +38,7 @@ main :: proc() {
 			mem.tracking_allocator_destroy(tracker)
 		}
 	}
+	log.info(args)
 
 
 }

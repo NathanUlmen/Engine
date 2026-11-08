@@ -1,7 +1,6 @@
 package main
 import "core:encoding/uuid"
 import "core:fmt"
-import "core:log"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -19,6 +18,7 @@ txt_extract :: proc(user_data: rawptr, file_path: string) -> (rawptr, Resource_E
 		return {}, .Extraction_Error
 	}
 	string_data, cpy_err := strings.clone_from_bytes(file_bytes)
+	assert(cpy_err == nil)
 	stored := new(string)
 	stored^ = string_data
 	return rawptr(stored), .None
@@ -32,18 +32,20 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 	}
 
 	split, err := strings.split_lines(str_data)
+	assert(err == nil)
 	defer delete(split)
 	artifacts := make([]Resource_Artifact, len(split))
 	defer delete(artifacts)
 	for line, i in split {
-		file_path := fmt.aprintf("out/out%v.txtout", i)
-		err := os.write_entire_file(file_path, line)
+		artifact_file_path := fmt.aprintf("out/out%v.txtout", i)
+		err := os.write_entire_file(artifact_file_path, line)
+		assert(err == nil)
 		artifacts[i] = {
 			id              = uuid.generate_v7_basic(nil),
 			cache_category  = {1024, TEXT_CACHE_CATEGORY},
 			dependencies    = nil,
-			baked_file_path = file_path,
-			name            = file_path,
+			baked_file_path = artifact_file_path,
+			name            = artifact_file_path,
 			import_version  = 1,
 		}
 	}

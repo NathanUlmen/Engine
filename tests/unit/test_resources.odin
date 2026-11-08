@@ -2,7 +2,6 @@ package tests
 import "../../src"
 import hm "core:container/handle_map"
 import "core:crypto"
-import "core:log"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -69,9 +68,7 @@ test_invalid_free :: proc(t: ^testing.T) {
 	free(rs)
 }
 
-test_acquire_loaded_resource :: proc(t: ^testing.T) {
-	rs := init_rsrc_sys_with_txt_serializer()
-}
+test_acquire_loaded_resource :: proc(t: ^testing.T) {}
 
 test_replace_serializer :: proc(t: ^testing.T) {
 }
@@ -107,7 +104,7 @@ test_cache_resize :: proc(t: ^testing.T) {
 
 	//assert that release worked an are no longer referenced
 	iterator := hm.iterator_make(&rs.handle_map)
-	for slot, handle in hm.iterate(&iterator) {
+	for slot, _ in hm.iterate(&iterator) {
 		testing.expect(t, slot.ref_count == 0)
 	}
 
