@@ -2,6 +2,7 @@ package tests
 import "../../src"
 import hm "core:container/handle_map"
 import "core:crypto"
+import "core:log"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -33,11 +34,12 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 	string_data := strings.split_lines(string(file_bytes))
 	for id in rs.id_to_artifact {
 		//acqurie handle
-		handle, error := src.load_resource(rs, id)
+		handle, error := src.load_resource(rs, id, string)
 		testing.expect(t, error == .None)
 
 		//resolve out handle and get the data.
 		data, e := src.handle_resolve(rs, handle)
+		log.info(data)
 		testing.expect(t, e == .None)
 		testing.expect(t, data != nil)
 
@@ -92,7 +94,7 @@ test_cache_resize :: proc(t: ^testing.T) {
 
 	//iterate through and move everything to cache
 	for id, _ in rs.id_to_artifact {
-		rs_handle, err := src.load_resource(rs, id)
+		rs_handle, err := src.load_resource(rs, id, string)
 		testing.expect(t, err == .None)
 
 		err = src.release_handle(rs, rs_handle)

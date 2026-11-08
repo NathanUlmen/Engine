@@ -23,7 +23,7 @@ Cache_Category :: struct {
 Resource_Store :: struct {
 	marshallers:    map[string]Resource_Marshaller,
 	id_to_artifact: map[Rsrc_Id]Resource_Artifact,
-	id_to_loaded:   map[Rsrc_Id]Rsrc_Handle,
+	id_to_loaded:   map[Rsrc_Id]hm.Handle64,
 	cache_lookup:   map[Cache_Id]CacheLRU,
 	sys_allocator:  mem.Allocator,
 	handle_map:     hm.Dynamic_Handle_Map(Resource_Slot, hm.Handle64),
@@ -44,10 +44,8 @@ Resource_Error :: enum {
 
 Rsrc_Id :: uuid.Identifier
 
-Rsrc_Handle :: hm.Handle64
-
-RsHandle :: struct($T: typeid) {
-	handle: ResourceHandle,
+Rs_Handle :: struct($T: typeid) {
+	handle: hm.Handle64,
 }
 
 Resource :: struct {
@@ -59,7 +57,7 @@ Resource :: struct {
 
 Resource_Slot :: struct {
 	using resource: Resource,
-	handle:         Rsrc_Handle,
+	handle:         hm.Handle64,
 	id:             Rsrc_Id,
 	ref_count:      u32,
 	status:         Load_Status,
@@ -98,9 +96,9 @@ Dispatcher :: struct {
 	post: proc(runnable: proc()),
 }
 
-Resource_Callback :: struct {
+Resource_Callback :: struct($T: typeid) {
 	user_data: rawptr,
-	cb:        proc(user_data: rawptr, handle: Rsrc_Handle),
+	cb:        proc(user_data: rawptr, handle: Rs_Handle(T)),
 }
 
 Marshaller_Context :: struct {
@@ -155,7 +153,7 @@ rsrc_sys_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator) {
 	rs.sys_allocator = allocator
 	rs.marshallers = make(map[string]Resource_Marshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[Rsrc_Id]Resource_Artifact, rs.sys_allocator)
-	rs.id_to_loaded = make(map[Rsrc_Id]Rsrc_Handle, rs.sys_allocator)
+	rs.id_to_loaded = make(map[Rsrc_Id]hm.Handle64, rs.sys_allocator)
 	rs.cache_lookup = make(map[Cache_Id]CacheLRU)
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 	//TODO: default cache creation and init
@@ -245,7 +243,7 @@ Acquires a handle to an already loaded resource. If the resource state is not LO
     - ResourceHandle: A handle to the resource.
     - Resource_Error: 
 */
-handle_acquire :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Handle, Resource_Error) {
+handle_acquire :: proc(rs: ^Resource_Store, id: Rsrc_Id, $T: typeid) -> (Rs_Handle(T), Resource_Error) {
 	handle := rs.id_to_loaded[id]
 	target_slot, contained := hm.get(&rs.handle_map, handle)
 	if contained && target_slot.status == .LOADED {
@@ -257,13 +255,13 @@ handle_acquire :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Handle, Resour
 		}
 		target_slot.ref_count += 1
 		//should we check for overflow here?
-		return target_slot.handle, .None
+		return Rs_Handle(T){handle = target_slot.handle}, .None
 	}
 	return {}, .Not_Loaded
 }
 
 @(private)
-add_new_slot :: proc(rs: ^Resource_Store, id: Rsrc_Id, resource: Resource) -> (Rsrc_Handle, Resource_Error) {
+add_new_slot :: proc(rs: ^Resource_Store, id: Rsrc_Id, resource: Resource, $T: typeid) -> (Rs_Handle(T), Resource_Error) {
 	slot: Resource_Slot = {
 		resource  = resource,
 		ref_count = 1,
@@ -275,7 +273,7 @@ add_new_slot :: proc(rs: ^Resource_Store, id: Rsrc_Id, resource: Resource) -> (R
 	added_slot, _ := hm.get(&rs.handle_map, handle)
 	rs.id_to_loaded[id] = handle
 	added_slot.handle = handle
-	return handle, .None
+	return Rs_Handle(T){handle}, .None
 }
 
 /*
@@ -289,7 +287,7 @@ the callback is sent to the dispatcher immediately.
     - callback: the procedure to execute once the resource has been acquired.
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
-handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback, cb_dispatcher: Dispatcher) -> Resource_Future {
+handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback(any), cb_dispatcher: Dispatcher) -> Resource_Future {
 	handle := rs.id_to_loaded[id]
 	slot, contained := hm.get(&rs.handle_map, handle)
 	if contained {
@@ -312,8 +310,8 @@ handle_batch_acquire_async :: proc(rs: ^Resource_Store) -> Resource_Future {
 
 
 */
-release_handle :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> Resource_Error {
-	slot, ok := hm.get(&rs.handle_map, handle)
+release_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_Error {
+	slot, ok := hm.get(&rs.handle_map, handle.handle)
 	if !ok {
 		return .Handle_Error
 	}
@@ -339,14 +337,14 @@ Resolves/dereferrences what ever the resource handle points to, this is used to 
     Returns:
     - rawptr: pointer to the actual data stored inside the system
 */
-handle_resolve :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> (rawptr, Resource_Error) {
-	result, ok := hm.get(&rs.handle_map, handle)
+handle_resolve :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (^T, Resource_Error) {
+	result, ok := hm.get(&rs.handle_map, handle.handle)
 	if !ok {
 		return nil, .Handle_Error
 	}
 	assert(result.ref_count > 0, "You are resolving a handle that you already freed or improperly duplicated!!")
 
-	return result.data, .None
+	return cast(^T)result.data, .None
 }
 
 /*
@@ -364,11 +362,11 @@ resource_shallow_copy :: proc {
 	resource_shallow_copy_on_id,
 }
 
-resource_shallow_copy_on_id :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Id, Rsrc_Handle) {
+resource_shallow_copy_on_id :: proc(rs: ^Resource_Store, id: Rsrc_Id, $T: typeid) -> (Rsrc_Id, Rs_Handle(T)) {
 	panic("TODO: resource_shallow_copy_on_id Unimplemented")
 }
 
-resource_shallow_copy_on_handle :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> (Rsrc_Id, Rsrc_Handle) {
+resource_shallow_copy_on_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rsrc_Id, Rs_Handle(T)) {
 	panic("TODO: resource_shallow_copy_on_handle Unimplemented")
 }
 
@@ -381,10 +379,10 @@ Copies a handle to a given resource and preserves reference counting
     Returns:
     - a copied resource handle that is reference counted
 */
-duplicate_handle :: proc(rs: ^Resource_Store, handle: Rsrc_Handle) -> (Rsrc_Handle, Resource_Error) {
-	result, ok := hm.get(&rs.handle_map, handle)
+duplicate_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Handle(T), Resource_Error) {
+	result, ok := hm.get(&rs.handle_map, handle.handle)
 	if !ok {
-		return {}, .Handle_Error
+		return Rs_Handle(T){}, .Handle_Error
 	}
 	result.ref_count += 1
 	return handle, .None
@@ -399,7 +397,7 @@ It's probably a good idea to free the original after calling this procedure.
     Returns:
     - the id to this handle
 */
-copy_resource_into_registry :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category) -> (Rsrc_Id, Rsrc_Handle, Resource_Error) {
+copy_resource_into_registry :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category, $T: typeid) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
 	panic("TODO: copy_resource_into_registry is Unimplemented")
 }
 
@@ -413,7 +411,7 @@ Assumes that the resource to be registered was allocated with the same allocator
     - Handle to the registered resource
     - Error status
 */
-resource_register :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category) -> (Rsrc_Id, Rsrc_Handle, Resource_Error) {
+resource_register :: proc(rs: ^Resource_Store, to_register: rawptr, cache_category: Cache_Category, $T: typeid) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
 	panic("TODO: resource_register is Unimplemented")
 }
 
@@ -439,14 +437,14 @@ loaded you will recieve a hanlde to it
     - RsrcHandle:
     - Resource_Error:
 */
-load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Handle, Resource_Error) {
-	handle, error := handle_acquire(rs, id)
+load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id, $T: typeid) -> (Rs_Handle(T), Resource_Error) {
+	handle, error := handle_acquire(rs, id, T)
 	#partial switch error {
 	case .Not_Loaded:
 		//check
 		artifact, contains := rs.id_to_artifact[id]
 		if !contains {
-			return {}, .Missing_Artifact
+			return Rs_Handle(T){}, .Missing_Artifact
 		}
 
 		//retrieve serializer
@@ -458,7 +456,7 @@ load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> (Rsrc_Handle, Resourc
 		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
 
-		return add_new_slot(rs, id, resource)
+		return add_new_slot(rs, id, resource, T)
 	case:
 		return handle, error
 	}

@@ -6,8 +6,8 @@ import rand "core:math/rand"
 SCENARIO_DURATION_SEC :: 10
 SEED :: 1
 
-create_resource_store :: proc() -> ^src.ResourceSystem {
-	rs: ^src.ResourceSystem
+create_resource_store :: proc() -> ^src.Resource_Store {
+	rs: ^src.Resource_Store
 	src.rsrc_sys_init(rs, context.allocator)
 	return rs
 }
@@ -28,7 +28,7 @@ test :: proc() {
 
 }
 
-release_acquire :: proc(rs: ^src.ResourceSystem, seed: i32) {
+release_acquire :: proc(rs: ^src.Resource_Store, seed: i32) {
 	for key, value in rs.id_to_artifact {
 		if rand.int31() % 2 == 0 {
 			// handle, _ := src.load_resource(rs, key)
