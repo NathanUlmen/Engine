@@ -4,6 +4,7 @@ import hm "core:container/handle_map"
 import list "core:container/intrusive/list"
 import "core:encoding/uuid"
 import "core:fmt"
+import "core:strings"
 _ :: fmt
 import "core:log"
 _ :: log
@@ -97,12 +98,12 @@ Resource_Future :: struct {
 }
 
 Dispatcher :: struct {
-	post: proc(runnable: proc()),
+	post: proc(to_run: Resource_Callback),
 }
 
-Resource_Callback :: struct($T: typeid) {
+Resource_Callback :: struct {
 	user_data: rawptr,
-	cb:        proc(user_data: rawptr, handle: Rs_Handle(T)),
+	cb:        proc(user_data: rawptr, handle: Rs_Handle(any)),
 }
 
 Marshaller_Context :: struct {
@@ -111,7 +112,7 @@ Marshaller_Context :: struct {
 }
 
 /*
-An "interface" used by the ResourceSystem.
+An "interface" used by the ResourceStore.
     Fields:
     - user_data: custom user data field 
     - extension: file extension that this serializer is capable of handling. Must include the '.' EX: ".txt"
@@ -178,19 +179,26 @@ rsrc_sys_destroy :: proc(rs: ^Resource_Store) {
 	for _, serializer in rs.marshallers {
 		serializer.destroy_serializer_context(serializer.user_data, rs.sys_allocator)
 	}
-	delete(rs.marshallers)
+
 	delete(rs.id_to_loaded)
 	delete(rs.cache_lookup)
-	// for _, &artifact in rs.id_to_artifact {
-	// 	artifact_destroy(&artifact)
-	// }
+	for _, &artifact in rs.id_to_artifact {
+		artifact_destroy(rs, &artifact)
+	}
+	delete(rs.marshallers)
 	delete(rs.id_to_artifact)
 
 	//dont like this, shouldnt call this.
 	// free_all(rs.sys_allocator)
 }
 
-artifact_destroy :: proc(artifact: ^Resource_Artifact) {
+artifact_destroy :: proc(rs: ^Resource_Store, artifact: ^Resource_Artifact) {
+	delete(artifact.dependencies, rs.sys_allocator)
+	delete(artifact.baked_file_path, rs.sys_allocator)
+	delete(artifact.name, rs.sys_allocator)
+	delete(artifact.progenitor_file_path, rs.sys_allocator)
+	delete(artifact.type, rs.sys_allocator)
+	delete(artifact._extension, rs.sys_allocator)
 }
 
 /*
@@ -220,6 +228,7 @@ Produces resrouce artifact(s) from a target_file
 rsrc_sys_import_file :: proc(rs: ^Resource_Store, target_file: string) -> Resource_Error {
 	//Retrieve serializer
 	extension := filepath.ext(target_file)
+	// defer delete(extension)
 	serializer, contains := rs.marshallers[extension]
 	if !contains {
 		return Resource_Error.Missing_Serializer
@@ -232,16 +241,20 @@ rsrc_sys_import_file :: proc(rs: ^Resource_Store, target_file: string) -> Resour
 
 	//update the extension
 	for &artifact in artifacts {
-		artifact._extension = extension
+		artifact._extension = strings.clone(extension)
+		if old, has := rs.id_to_artifact[artifact.id]; has {
+			artifact_destroy(rs, &old)
+		}
 		rs.id_to_artifact[artifact.id] = artifact
 	}
+
 	return .None
 }
 
 /*
 Acquires a handle to an already loaded resource. If the resource state is not LOADED it will return an error.
     Inputs:
-    - rs: the ResourceSystem to 
+    - rs: the ResourceStore to 
     - id: The stable id to the resource you wish to read from memory.
     Returns:
     - ResourceHandle: A handle to the resource.
@@ -270,6 +283,7 @@ add_new_slot :: proc(rs: ^Resource_Store, id: Rsrc_Id, resource: Resource, $T: t
 		resource  = resource,
 		ref_count = 1,
 		id        = id,
+		status    = .LOADED, //correct for now, will need to change in the future when async is added.
 	}
 	handle, alloc_err := hm.add(&rs.handle_map, slot)
 	assert(alloc_err == nil)
@@ -286,12 +300,12 @@ yet loaded it is loaded asynchronously. Once the resource is loaded into Memory 
 is sent to the dispatcher where it can then be fired. If the requested resource is already in memory 
 the callback is sent to the dispatcher immediately. The user must 
     Inputs:
-    - rs: the ResourceSystem to 
+    - rs: the ResourceStore to 
     - id: The stable id to the resource you wish to read from memory.
     - callback: the procedure to execute once the resource has been acquired.
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
-handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback($T), cb_dispatcher: Dispatcher) -> Resource_Future {
+handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback, cb_dispatcher: Dispatcher) -> Resource_Future {
 	handle := rs.id_to_loaded[id]
 	slot, contained := hm.get(&rs.handle_map, handle)
 	if contained {
@@ -299,6 +313,7 @@ handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resourc
 		//TODO: post callback to dispatcher
 		return Resource_Future{.LOADED}
 	}
+
 
 	panic("handle_acquire_async Unimplemented")
 }
@@ -321,12 +336,13 @@ release_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_E
 	}
 
 	slot.ref_count -= 1
-	assert(slot.ref_count != bits.U32_MAX, "Multiple Invalid Frees have occurred!")
+	assert(slot.ref_count != bits.U32_MAX, "Invalid Frees have occurred!")
 
 	//give ownership to the cache
 	if slot.ref_count == 0 {
 		artifact := rs.id_to_artifact[slot.id]
 		cache, err := ensure_cache(rs, artifact)
+		//TODO: handle this error better in the future
 		assert(err == .None)
 		cache_add_entry(rs, cache, slot)
 	}
@@ -339,7 +355,7 @@ Resolves/dereferrences what ever the resource handle points to, this is used to 
     - rs:
     - handle:
     Returns:
-    - rawptr: pointer to the actual data stored inside the system
+    - rawptr: pointer to the actual data stored inside the store 
 */
 handle_resolve :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (^T, Resource_Error) {
 	slot, ok := hm.get(&rs.handle_map, handle.handle)
@@ -405,7 +421,8 @@ It's probably a good idea to free the original after calling this procedure.
     Returns:
     - the id to this handle
 */
-copy_resource_into_registry :: proc(rs: ^Resource_Store, to_register: ^$T, cache_category: Cache_Category) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
+copy_resource_into_registry :: proc(rs: ^Resource_Store, resource: Resource, cache_category: Cache_Category, $T: typeid) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
+
 	panic("TODO: copy_resource_into_registry is Unimplemented")
 }
 
@@ -419,7 +436,7 @@ Assumes that the resource to be registered was allocated with the same allocator
     - Handle to the registered resource
     - Error status
 */
-resource_register :: proc(rs: ^Resource_Store, to_register: ^$T, cache_category: Cache_Category) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
+resource_register :: proc(rs: ^Resource_Store, to_register: Resource, cache_category: Cache_Category, $T: typeid) -> (Rsrc_Id, Rs_Handle(T), Resource_Error) {
 	panic("TODO: resource_register is Unimplemented")
 }
 
@@ -427,11 +444,11 @@ resource_register :: proc(rs: ^Resource_Store, to_register: ^$T, cache_category:
 
 */
 resource_load_status :: proc(rs: ^Resource_Store, id: Rsrc_Id) -> Load_Status {
-	_, contained := rs.id_to_loaded[id]
+	handle, contained := rs.id_to_loaded[id]
 	if contained {
-		return .LOADED
+		return hm.get(&rs.handle_map, handle).status
 	} else {
-		panic("TODO: resource_load_status Unimplemented")
+		return .NOT_LOADED
 	}
 }
 
@@ -463,8 +480,11 @@ load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id, $T: typeid) -> (Rs_Handl
 
 		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
-		//TODO: return an error for this later on once we polish everything up
-		assert(T == resource.type, fmt.aprintf("Providied resource type of %v does not match returned type %v", typeid_of(T), resource.type))
+		// TODO: return an error for this later on once we polish everything up
+		if T != resource.type {
+			resource.destructor(resource.data, rs)
+			return {}, .Type_Missmatch
+		}
 
 		return add_new_slot(rs, id, resource, T)
 	case:

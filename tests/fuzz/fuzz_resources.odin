@@ -2,9 +2,10 @@ package fuzz
 
 import "../../src"
 import rand "core:math/rand"
+import "core:testing"
 
-SCENARIO_DURATION_SEC :: 10
 SEED :: 1
+ITER_OPS :: 10
 
 create_resource_store :: proc() -> ^src.Resource_Store {
 	rs: ^src.Resource_Store
@@ -12,7 +13,8 @@ create_resource_store :: proc() -> ^src.Resource_Store {
 	return rs
 }
 
-test :: proc() {
+@(test)
+test :: proc(t: testing.T) {
 	rand.reset(SEED)
 	rs := create_resource_store()
 	defer src.rsrc_sys_destroy(rs)
@@ -20,8 +22,7 @@ test :: proc() {
 
 	release_acquire_seed := rand.int31()
 
-	//loop until duration is over
-	for {
+	for i in 0 ..< 1_000 {
 		release_acquire(rs, release_acquire_seed)
 	}
 
@@ -29,12 +30,18 @@ test :: proc() {
 }
 
 release_acquire :: proc(rs: ^src.Resource_Store, seed: i32) {
+	history: [ITER_OPS]i32
 	for key, value in rs.id_to_artifact {
-		if rand.int31() % 2 == 0 {
-			// handle, _ := src.load_resource(rs, key)
-		} else {
+		src.load_resource(rs, key, string)
+		for i in 0 ..< ITER_OPS {
+			history[i] = rand.int31()
+
+			if rand.int31() % 2 == 0 {
+				src.load_resource(rs, key, string)
+			} else {
+				src.handle_acquire(rs, key, string)
+			}
+
 		}
-
 	}
-
 }

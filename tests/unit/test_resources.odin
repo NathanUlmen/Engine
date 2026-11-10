@@ -1,8 +1,11 @@
 package tests
 import "../../src"
+import "core:c/libc/tests"
 import hm "core:container/handle_map"
 import "core:crypto"
+import "core:encoding/uuid"
 import "core:log"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -25,13 +28,15 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
 	rs := init_rsrc_sys_with_txt_serializer()
 	src.rsrc_sys_import_file(rs, "testData.txt")
-	defer src.rsrc_sys_destroy(rs)
 	file_bytes, _ := os.read_entire_file("testData.txt", context.allocator)
-	defer delete(file_bytes)
-	defer free(rs)
-
+	defer {
+		src.rsrc_sys_destroy(rs)
+		delete(file_bytes)
+		free(rs)
+	}
 
 	string_data := strings.split_lines(string(file_bytes))
+	defer delete(string_data)
 	for id in rs.id_to_artifact {
 		//acqurie handle
 		handle, error := src.load_resource(rs, id, string)
@@ -65,23 +70,143 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 
 @(test)
 test_invalid_free :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
 	rs := init_rsrc_sys_with_txt_serializer()
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+	}
+	err := src.rsrc_sys_import_file(rs, "testData.txt")
+	testing.expect(t, err == .None)
+
+	testing.cleanup(t, cleanup_rs_store, rs)
+	for id, _ in rs.id_to_artifact {
+		err := src.release_handle(rs, src.Rs_Handle(string){})
+		testing.expect(t, err == .Handle_Error)
+
+		handle, _ := src.load_resource(rs, id, string)
+
+
+		err = src.release_handle(rs, handle)
+		testing.expect(t, err == .None)
+
+		testing.expect_assert(t, "Invalid Frees have occurred!")
+		src.release_handle(rs, handle)
+	}
+
+}
+
+@(test)
+test_acquire_loaded_resource :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rsrc_sys_with_txt_serializer()
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+	}
+
+	err := src.rsrc_sys_import_file(rs, "testData.txt")
+	testing.expect(t, err == .None)
+
+	for id, _ in rs.id_to_artifact {
+		_, err := src.handle_acquire(rs, id, string)
+		testing.expect(t, err == .Not_Loaded)
+
+		status := src.resource_load_status(rs, id)
+		testing.expect(t, status == .NOT_LOADED)
+
+		loaded, _ := src.load_resource(rs, id, string)
+		testing.expect(t, src.resource_load_status(rs, id) == .LOADED)
+
+		other, _ := src.handle_acquire(rs, id, string)
+		testing.expect(t, ref_count(rs, id) == 2)
+
+		src.release_handle(rs, loaded)
+		src.release_handle(rs, other)
+
+		testing.expect(t, ref_count(rs, id) == 0)
+	}
+
+
+}
+
+cleanup_rs_store :: proc(data: rawptr) {
+	rs := cast(^src.Resource_Store)data
 	src.rsrc_sys_destroy(rs)
 	free(rs)
 }
 
-test_acquire_loaded_resource :: proc(t: ^testing.T) {}
 
-test_replace_serializer :: proc(t: ^testing.T) {
+@(test)
+test_duplicate_handle :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rsrc_sys_with_txt_serializer()
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+	}
+
+	err := src.rsrc_sys_import_file(rs, "testData.txt")
+	testing.expect(t, err == .None)
+
+	for id, _ in rs.id_to_artifact {
+		_, err := src.duplicate_handle(rs, src.Rs_Handle(string){})
+		testing.expect(t, err == .Handle_Error)
+		og, _ := src.load_resource(rs, id, string)
+		for i in 0 ..< 5 {
+			tmp, _ := src.duplicate_handle(rs, og)
+			testing.expect(t, ref_count(rs, id) == u32(i + 2))
+			data, _ := src.handle_resolve(rs, tmp)
+			testing.expect(t, data != nil)
+		}
+		testing.expect(t, ref_count(rs, id) == u32(6))
+	}
+
 }
 
-test_copy_resource :: proc(t: ^testing.T) {}
+ref_count :: proc(rs: ^src.Resource_Store, id: src.Rsrc_Id) -> u32 {
+	return hm.get(&rs.handle_map, rs.id_to_loaded[id]).ref_count
+}
+
+test_replace_serializer :: proc(t: ^testing.T) {
+
+}
+
+// @(test)
+test_copy_resource :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rsrc_sys_with_txt_serializer()
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+	}
+
+
+	to_copy := src.Resource{}
+	src.copy_resource_into_registry(rs, to_copy, {0, src.TEXT_CACHE_CATEGORY}, string)
+}
 
 test_load_status :: proc(t: ^testing.T) {}
 
 test_invalid_handle :: proc(t: ^testing.T) {}
 
-test_invalid_id :: proc(t: ^testing.T) {}
+@(test)
+test_invalid_id :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rsrc_sys_with_txt_serializer()
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+	}
+
+	err := src.rsrc_sys_import_file(rs, "testData.txt")
+	testing.expect(t, err == .None)
+
+	_, err = src.load_resource(rs, {}, bool)
+
+	testing.expect(t, err == .Missing_Artifact)
+
+}
 
 test_missing_serializer :: proc(t: ^testing.T) {}
 
@@ -97,21 +222,22 @@ test_type_validation :: proc(t: ^testing.T) {
 	err := src.rsrc_sys_import_file(rs, "testData.txt")
 	testing.expect(t, err == .None)
 
-	for id, _ in rs.id_to_artifact {
-		testing.expect_assert(t, "Providied resource type of bool does not match returned type string")
-		bad_handle, _ := src.load_resource(rs, id, bool)
-		testing.expect(t, bad_handle == {})
 
-		handle, _ := src.load_resource(rs, id, string)
-		testing.expect(t, handle != {})
+	for id, _ in rs.id_to_artifact {
+		bad_handle, err := src.load_resource(rs, id, bool)
+		testing.expect(t, err == .Type_Missmatch)
 	}
+
 }
 
 @(test)
 test_cache_resize :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
 	rs := init_rsrc_sys_with_txt_serializer()
-	defer src.rsrc_sys_destroy(rs)
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+	}
 	src.rsrc_sys_import_file(rs, "testData.txt")
 
 	//iterate through and move everything to cache

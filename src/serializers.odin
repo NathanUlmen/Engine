@@ -45,7 +45,7 @@ txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Al
 			cache_category  = {1024, TEXT_CACHE_CATEGORY},
 			dependencies    = nil,
 			baked_file_path = artifact_file_path,
-			name            = artifact_file_path,
+			name            = strings.clone(artifact_file_path),
 			import_version  = 1,
 		}
 	}
