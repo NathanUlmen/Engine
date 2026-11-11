@@ -8,6 +8,7 @@ import "core:log"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 
 create_test_rsrc_sys :: proc() -> ^src.Resource_Store {
@@ -21,6 +22,17 @@ init_rsrc_sys_with_txt_serializer :: proc() -> ^src.Resource_Store {
 	rs := create_test_rsrc_sys()
 	src.rsrc_sys_register_marshaller(rs, src.default_txt_serializer())
 	return rs
+}
+
+
+ref_count :: proc(rs: ^src.Resource_Store, id: src.Rsrc_Id) -> u32 {
+	return hm.get(&rs.handle_map, rs.id_to_loaded[id]).ref_count
+}
+
+cleanup_rs_store :: proc(data: rawptr) {
+	rs := cast(^src.Resource_Store)data
+	src.rsrc_sys_destroy(rs)
+	free(rs)
 }
 
 @(test)
@@ -44,7 +56,7 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 
 		//resolve out handle and get the data.
 		data, e := src.handle_resolve(rs, handle)
-		log.info(data^)
+
 		testing.expect(t, e == .None)
 		testing.expect(t, data != nil)
 
@@ -86,7 +98,6 @@ test_invalid_free :: proc(t: ^testing.T) {
 
 		handle, _ := src.load_resource(rs, id, string)
 
-
 		err = src.release_handle(rs, handle)
 		testing.expect(t, err == .None)
 
@@ -126,14 +137,6 @@ test_acquire_loaded_resource :: proc(t: ^testing.T) {
 
 		testing.expect(t, ref_count(rs, id) == 0)
 	}
-
-
-}
-
-cleanup_rs_store :: proc(data: rawptr) {
-	rs := cast(^src.Resource_Store)data
-	src.rsrc_sys_destroy(rs)
-	free(rs)
 }
 
 
@@ -164,32 +167,6 @@ test_duplicate_handle :: proc(t: ^testing.T) {
 
 }
 
-ref_count :: proc(rs: ^src.Resource_Store, id: src.Rsrc_Id) -> u32 {
-	return hm.get(&rs.handle_map, rs.id_to_loaded[id]).ref_count
-}
-
-test_replace_serializer :: proc(t: ^testing.T) {
-
-}
-
-// @(test)
-test_copy_resource :: proc(t: ^testing.T) {
-	context.random_generator = crypto.random_generator()
-	rs := init_rsrc_sys_with_txt_serializer()
-	defer {
-		src.rsrc_sys_destroy(rs)
-		free(rs)
-	}
-
-
-	to_copy := src.Resource{}
-	src.copy_resource_into_registry(rs, to_copy, {0, src.TEXT_CACHE_CATEGORY}, string)
-}
-
-test_load_status :: proc(t: ^testing.T) {}
-
-test_invalid_handle :: proc(t: ^testing.T) {}
-
 @(test)
 test_invalid_id :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
@@ -207,8 +184,6 @@ test_invalid_id :: proc(t: ^testing.T) {
 	testing.expect(t, err == .Missing_Artifact)
 
 }
-
-test_missing_serializer :: proc(t: ^testing.T) {}
 
 @(test)
 test_type_validation :: proc(t: ^testing.T) {
@@ -271,4 +246,70 @@ test_cache_resize :: proc(t: ^testing.T) {
 
 	//assert that items were deleted.
 	testing.expect(t, len(rs.id_to_loaded) == 0)
+}
+
+@(test)
+test_async_loading :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rsrc_sys_with_txt_serializer()
+	cb_data := new(int)
+	defer {
+		src.rsrc_sys_destroy(rs)
+		free(rs)
+		free(cb_data)
+	}
+
+	src.rsrc_sys_import_file(rs, "testData.txt")
+
+	Data :: struct {
+		count: ^int,
+		t:     ^testing.T,
+	}
+
+
+	foo :: proc(data: rawptr, foo: src.Rs_Handle(any)) {
+		v := cast(^Data)data
+		sync.atomic_add(v.count, 1)
+		testing.expect(v.t, foo != {})
+	}
+
+
+	runner :: proc(cb: src.Resource_Callback) {
+		cb.cb(cb.user_data, {})
+	}
+
+
+	blah := new(Data)
+	defer free(blah)
+	blah^ = {cb_data, t}
+	for id, _ in rs.id_to_artifact {
+		src.load_resource_async(rs, id, {user_data = blah, cb = foo}, {runner}, string)
+	}
+
+
+	//loop till all are loaded
+	for {
+		b := false
+		for id, _ in rs.id_to_artifact {
+			status := src.resource_load_status(rs, id)
+			if status == .LOADED {
+				b = true
+			} else {
+				b = false
+				break
+			}
+		}
+		if b do break
+	}
+
+
+	//TODO: There is a race here, wait till all are loaded
+	log.info("async count: ", cb_data^)
+	testing.expect(t, cb_data^ == len(rs.id_to_artifact))
+
+	for id, _ in rs.id_to_artifact {
+		testing.expect(t, ref_count(rs, id) == 1)
+	}
+
+
 }

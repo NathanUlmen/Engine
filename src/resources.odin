@@ -5,6 +5,7 @@ import list "core:container/intrusive/list"
 import "core:encoding/uuid"
 import "core:fmt"
 import "core:strings"
+import "core:thread"
 _ :: fmt
 import "core:log"
 _ :: log
@@ -30,6 +31,7 @@ Resource_Store :: struct {
 	cache_lookup:   map[Cache_Id]CacheLRU,
 	sys_allocator:  mem.Allocator,
 	handle_map:     hm.Dynamic_Handle_Map(Resource_Slot, hm.Handle64),
+	pool:           ^thread.Pool,
 }
 
 Resource_Error :: enum {
@@ -161,6 +163,8 @@ rsrc_sys_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator) {
 	rs.id_to_loaded = make(map[Rsrc_Id]hm.Handle64, rs.sys_allocator)
 	rs.cache_lookup = make(map[Cache_Id]CacheLRU)
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
+	rs.pool = new(thread.Pool)
+	thread.pool_init(rs.pool, rs.sys_allocator, 1)
 	//TODO: default cache creation and init
 }
 
@@ -168,7 +172,10 @@ rsrc_sys_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator) {
 
 */
 rsrc_sys_destroy :: proc(rs: ^Resource_Store) {
-	context.allocator = rs.sys_allocator
+	thread.pool_join(rs.pool)
+	thread.pool_destroy(rs.pool)
+	free(rs.pool)
+
 	iterator := hm.iterator_make(&rs.handle_map)
 	for slot, _ in hm.iterate(&iterator) {
 		slot.resource.destructor(slot.data, rs)
@@ -187,7 +194,6 @@ rsrc_sys_destroy :: proc(rs: ^Resource_Store) {
 	}
 	delete(rs.marshallers)
 	delete(rs.id_to_artifact)
-
 	//dont like this, shouldnt call this.
 	// free_all(rs.sys_allocator)
 }
@@ -305,7 +311,7 @@ the callback is sent to the dispatcher immediately. The user must
     - callback: the procedure to execute once the resource has been acquired.
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
-handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback, cb_dispatcher: Dispatcher) -> Resource_Future {
+load_resource_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resource_Callback, cb_dispatcher: Dispatcher, $T: typeid) -> Resource_Future {
 	handle := rs.id_to_loaded[id]
 	slot, contained := hm.get(&rs.handle_map, handle)
 	if contained {
@@ -314,14 +320,66 @@ handle_acquire_async :: proc(rs: ^Resource_Store, id: Rsrc_Id, callback: Resourc
 		return Resource_Future{.LOADED}
 	}
 
+	//Case: Resrouce not loaded.
+	//1. Reserve/check out a slot for our data.
+	new_slot_handle, err := add_new_slot(rs, id, {}, T)
+	//TODO
+	assert(err == .None)
 
-	panic("handle_acquire_async Unimplemented")
+	//dynamic
+	reserved_slot, _ := hm.dynamic_get(&rs.handle_map, new_slot_handle.handle)
+	reserved_slot.status = .IN_PROGRESS
+
+
+	//2. Start loading of our resrouce
+	artifact, cont := rs.id_to_artifact[id]
+	if !cont {
+		return {.ERROR}
+	}
+
+	marshaller, has := rs.marshallers[artifact._extension]
+	if !has {
+		return Resource_Future{.ERROR}
+	}
+
+	Bar :: struct {
+		file_path:  string,
+		marshaller: Resource_Marshaller,
+		rs:         ^Resource_Store,
+		slot:       ^Resource_Slot,
+		cb:         Resource_Callback,
+		dispatcher: Dispatcher,
+	}
+
+	bar := new(Bar)
+	bar^ = {artifact.baked_file_path, marshaller, rs, reserved_slot, callback, cb_dispatcher}
+
+	foo :: proc(task: thread.Task) {
+		casted := cast(^Bar)task.data
+
+		//TODO: update create_resource to have the ability to return an error
+		resource := casted.marshaller.create_resource(casted.marshaller.user_data, casted.file_path, casted.rs, casted.rs.sys_allocator)
+		assert(resource.data != nil)
+
+		//insert resource into slot
+		casted.slot.resource = resource
+		casted.slot.status = .LOADED
+
+		//TODO: Dispatcher callback
+		// casted.dispatcher.post(casted.cb)
+		casted.cb.cb(casted.cb.user_data, Rs_Handle(any){casted.slot.handle})
+		free(casted)
+	}
+
+	thread.pool_add_task(rs.pool, rs.sys_allocator, foo, bar)
+	thread.pool_start(rs.pool)
+	return {.IN_PROGRESS}
 }
 
 /*
 
 */
-handle_batch_acquire_async :: proc(rs: ^Resource_Store) -> Resource_Future {
+batch_load_async :: proc(rs: ^Resource_Store) -> Resource_Future {
 	panic("handle_batch_acquire_async Unimplemented")
 }
 
@@ -480,7 +538,7 @@ load_resource :: proc(rs: ^Resource_Store, id: Rsrc_Id, $T: typeid) -> (Rs_Handl
 
 		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
-		// TODO: return an error for this later on once we polish everything up
+
 		if T != resource.type {
 			resource.destructor(resource.data, rs)
 			return {}, .Type_Missmatch
