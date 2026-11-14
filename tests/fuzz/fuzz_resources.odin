@@ -9,7 +9,7 @@ ITER_OPS :: 10
 
 create_resource_store :: proc() -> ^src.Resource_Store {
 	rs: ^src.Resource_Store
-	src.rsrc_sys_init(rs, context.allocator)
+	src.rs_store_init(rs, context.allocator)
 	return rs
 }
 
@@ -32,12 +32,12 @@ test :: proc(t: testing.T) {
 release_acquire :: proc(rs: ^src.Resource_Store, seed: i32) {
 	history: [ITER_OPS]i32
 	for key, value in rs.id_to_artifact {
-		src.load_resource(rs, key, string)
+		src.resource_load(rs, key, string)
 		for i in 0 ..< ITER_OPS {
 			history[i] = rand.int31()
 
 			if rand.int31() % 2 == 0 {
-				src.load_resource(rs, key, string)
+				src.resource_load(rs, key, string)
 			} else {
 				src.handle_acquire(rs, key, string)
 			}

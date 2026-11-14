@@ -11,19 +11,6 @@ default_txt_serializer :: proc() -> Resource_Marshaller {
 	return {{nil, context_destructor}, ".txt", txt_bake_to_disk, txt_read_from_disk}
 }
 
-txt_extract :: proc(user_data: rawptr, file_path: string) -> (rawptr, Resource_Error) {
-	file_bytes, err := os.read_entire_file_from_path(file_path, context.allocator)
-	defer delete(file_bytes)
-	if err != nil {
-		return {}, .Extraction_Error
-	}
-	string_data, cpy_err := strings.clone_from_bytes(file_bytes)
-	assert(cpy_err == nil)
-	stored := new(string)
-	stored^ = string_data
-	return rawptr(stored), .None
-}
-
 txt_bake_to_disk :: proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> ([]Resource_Artifact, bool) {
 	file_bytes, _ := os.read_entire_file(file_path, allocator)
 	str_data := string(file_bytes)
