@@ -156,9 +156,14 @@ Resource_Artifact :: struct {
 }
 
 /*
+Initializes all the fields of the Resource_System. 
 
+Inputs:
+    - rs: 
+    - allocator: The allocator that the Resource_Store will use for all allocations.
+    - thread_count: The number of threads available to use for asynchronous loading.
 */
-rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator) {
+rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator, thread_count: int = 1) {
 	//TODO: figure out how to assert random generation is enabled/init.
 	rs.sys_allocator = allocator
 	rs.marshallers = make(map[string]Resource_Marshaller, rs.sys_allocator)
@@ -167,12 +172,14 @@ rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator) {
 	rs.cache_lookup = make(map[Cache_Id]CacheLRU)
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 	rs.pool = new(thread.Pool)
-	thread.pool_init(rs.pool, rs.sys_allocator, 1)
+	thread.pool_init(rs.pool, rs.sys_allocator, thread_count)
 	//TODO: default cache creation and init
 }
 
 /*
-
+Frees all resources stored stored inside the Resource_Store. Shutsdown thread pool by joining.
+Inputs:
+    - rs: The system that will be freed. 
 */
 rs_store_destroy :: proc(rs: ^Resource_Store) {
 	thread.pool_join(rs.pool)
@@ -211,7 +218,10 @@ artifact_destroy :: proc(rs: ^Resource_Store, artifact: ^Resource_Artifact) {
 }
 
 /*
-    Inputs:
+Adds a Resource_Marshaller to the resource system. Marshallers are used by the resource store to read resource data from files into memory.
+They are also used to produce Resource_Artifacts which is a container that stores info about a Resource. Resource_Artifacts are used like a manifest.
+Marshallers are invoked/used based on file extension.
+    Inputs
     - rs:
     - serializer:
 */
@@ -229,12 +239,17 @@ rs_store_register_marshaller :: proc(rs: ^Resource_Store, serializer: Resource_M
 }
 
 /*
-Produces resrouce artifact(s) from a target_file
+The Resource_Store produces Resource_Artifact(s) by invoking a user registered Marshaller. The Marshaller to invoke
+is determiend by the file extension of the file to be imported. The Resource_Artifact(s) produced by the Marshaller added to a 
+manifest that the Resource_Store uses to handle loading and .. TODO.
     Inputs:
-    - rs:
-    - target_file:
+    - rs: The Resource_Store that will have the 
+    - target_file: file to be imported.
+    Returns:
+    - err: A Missing_Serializer when a Marshaller is not present or a Serialization_Error when something goes wrong during the import
+    process in the Marshallers import_resource procedure.
 */
-rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> Resource_Error {
+rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: Resource_Error) {
 	//Retrieve serializer
 	extension := filepath.ext(target_file)
 	serializer, contains := rs.marshallers[extension]
@@ -260,9 +275,10 @@ rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> Resour
 }
 
 /*
-Acquires a handle to an already loaded resource. If the resource state is not LOADED it will return an error.
+Acquires a handle to an already loaded resource. If the resource state is not LOADED it will return an error. This operations is 
+relatively expensive compared to handle_duplicate.
     Inputs:
-    - rs: the ResourceStore to 
+    - rs: The Resource_Store to 
     - id: The stable id to the resource you wish to read from memory.
     Returns:
     - ResourceHandle: A handle to the resource.
@@ -272,6 +288,9 @@ handle_acquire :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle
 	handle := rs.id_to_loaded[id]
 	target_slot, contained := hm.get(&rs.handle_map, handle)
 	if contained && target_slot.status == .LOADED {
+		if target_slot.type != T {
+			return {}, .Type_Missmatch
+		}
 		//our resource was in cache, we need to remove it now.
 		if target_slot.ref_count == 0 {
 			category := rs.id_to_artifact[id].cache_category
@@ -285,21 +304,115 @@ handle_acquire :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle
 	return {}, .Not_Loaded
 }
 
-@(private)
-add_new_slot :: proc(rs: ^Resource_Store, id: Rs_Id, resource: Resource, $T: typeid, status: Load_Status = .LOADED) -> (Rs_Handle(T), Resource_Error) {
-	slot: Resource_Slot = {
-		resource  = resource,
-		ref_count = 1,
-		id        = id,
-		status    = status,
+/*
+Copies a handle to a resource, incrementing the ref_count in the process. 
+    Inuts:
+    - rs:
+    - handle:
+    Returns:
+    - a copied resource handle that is reference counted
+*/
+handle_duplicate :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Handle(T), Resource_Error) {
+	result, ok := hm.get(&rs.handle_map, handle.handle)
+	if !ok {
+		return Rs_Handle(T){}, .Handle_Error
 	}
-	handle, alloc_err := hm.add(&rs.handle_map, slot)
-	assert(alloc_err == nil)
+	result.ref_count += 1
+	return handle, .None
+}
 
-	added_slot, _ := hm.get(&rs.handle_map, handle)
-	rs.id_to_loaded[id] = handle
-	added_slot.handle = handle
-	return Rs_Handle(T){handle}, .None
+/*
+"Releases" the handle to the associated Resource, decreasing the ref_count by one.
+    Inputs:
+    - rs:
+    - handle:
+    Returns:
+    - err:
+*/
+handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_Error {
+	slot, ok := hm.get(&rs.handle_map, handle.handle)
+	if !ok {
+		return .Handle_Error
+	}
+
+	slot.ref_count -= 1
+	assert(slot.ref_count != bits.U32_MAX, "Invalid Frees have occurred!")
+
+	//give ownership to the cache
+	if slot.ref_count == 0 {
+		artifact, contained := rs.id_to_artifact[slot.id]
+		//this means a resource was registered and thus should not be cached.
+		if !contained {
+			return resource_remove(rs, slot)
+		}
+		cache, err := ensure_cache(rs, artifact)
+		//TODO: handle this error better in the future
+		assert(err == .None)
+		cache_add_entry(rs, cache, slot)
+	}
+	return .None
+}
+
+/*
+Resolves/dereferrences what ever the resource handle points to, this is used to get the raw data that is stored.
+    Inputs:
+    - rs:
+    - handle:
+    Returns:
+    - rawptr: pointer to the actual data stored inside the store 
+*/
+handle_resolve :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (^T, Resource_Error) {
+	slot, ok := hm.get(&rs.handle_map, handle.handle)
+	if !ok {
+		return nil, .Handle_Error
+	}
+	assert(slot.ref_count > 0, "You are resolving a handle that you already freed or improperly duplicated!!")
+
+	if slot.type != T {
+		return nil, .Type_Missmatch
+	}
+
+	return cast(^T)slot.data, .None
+}
+
+/*
+Loads a resource in a synchronous/blocking fashion and gives you a handle to it. If the resource is already 
+loaded you will recieve a hanlde to it
+    Inputs:
+    - rs:
+    - id:
+    Returns:
+    - RsrcHandle:
+    - Resource_Error:
+*/
+resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(T), Resource_Error) {
+	handle, error := handle_acquire(rs, id, T)
+	#partial switch error {
+	case .Not_Loaded:
+		//check
+		artifact, contains := rs.id_to_artifact[id]
+		if !contains {
+			return Rs_Handle(T){}, .Missing_Artifact
+		}
+
+		//retrieve serializer
+		serializer, ok := rs.marshallers[artifact._extension]
+		if !ok {
+			return {}, .Missing_Serializer
+		}
+
+		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
+		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
+
+		if T != resource.type {
+			resource.destructor(resource.data, rs)
+			return {}, .Type_Missmatch
+		}
+
+		return add_new_slot(rs, id, resource, T)
+	case:
+		return handle, error
+	}
 }
 
 /*
@@ -385,73 +498,6 @@ batch_load_async :: proc(rs: ^Resource_Store) -> Resource_Future {
 	panic("handle_batch_acquire_async Unimplemented")
 }
 
-/*
-
-
-*/
-handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_Error {
-	slot, ok := hm.get(&rs.handle_map, handle.handle)
-	if !ok {
-		return .Handle_Error
-	}
-
-	slot.ref_count -= 1
-	assert(slot.ref_count != bits.U32_MAX, "Invalid Frees have occurred!")
-
-	//give ownership to the cache
-	if slot.ref_count == 0 {
-		artifact, contained := rs.id_to_artifact[slot.id]
-		//this means a resource was registered and thus should not be cached.
-		if !contained {
-			return resource_remove(rs, slot)
-		}
-		cache, err := ensure_cache(rs, artifact)
-		//TODO: handle this error better in the future
-		assert(err == .None)
-		cache_add_entry(rs, cache, slot)
-	}
-	return .None
-}
-
-/*
-Resolves/dereferrences what ever the resource handle points to, this is used to get the raw data that is stored.
-    Inputs:
-    - rs:
-    - handle:
-    Returns:
-    - rawptr: pointer to the actual data stored inside the store 
-*/
-handle_resolve :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (^T, Resource_Error) {
-	slot, ok := hm.get(&rs.handle_map, handle.handle)
-	if !ok {
-		return nil, .Handle_Error
-	}
-	assert(slot.ref_count > 0, "You are resolving a handle that you already freed or improperly duplicated!!")
-
-	if slot.type != T {
-		return nil, .Type_Missmatch
-	}
-
-	return cast(^T)slot.data, .None
-}
-
-/*
-Copies a handle to a given resource and preserves reference counting
-    Inuts:
-    - rsrc_sys:
-    - handle:
-
-    Returns:
-    - a copied resource handle that is reference counted
-*/
-handle_duplicate :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Handle(T), Resource_Error) {
-	result, ok := hm.get(&rs.handle_map, handle.handle)
-	if !ok {
-		return Rs_Handle(T){}, .Handle_Error
-	}
-	result.ref_count += 1
-	return handle, .None
-}
 
 /*
 Creates a new entry in the Resource_Store and stores the 'to_register' resource inside of the store. This procedure assumes that the 
@@ -486,44 +532,22 @@ resource_load_status :: proc(rs: ^Resource_Store, id: Rs_Id) -> Load_Status {
 	}
 }
 
-/*
-Loads a resource in a synchronous/blocking fashion and gives you a handle to it. If the resource is already 
-loaded you will recieve a hanlde to it
-    Inputs:
-    - rs:
-    - id:
-    Returns:
-    - RsrcHandle:
-    - Resource_Error:
-*/
-resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(T), Resource_Error) {
-	handle, error := handle_acquire(rs, id, T)
-	#partial switch error {
-	case .Not_Loaded:
-		//check
-		artifact, contains := rs.id_to_artifact[id]
-		if !contains {
-			return Rs_Handle(T){}, .Missing_Artifact
-		}
 
-		//retrieve serializer
-		serializer, ok := rs.marshallers[artifact._extension]
-		if !ok {
-			return {}, .Missing_Serializer
-		}
-
-		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
-		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
-
-		if T != resource.type {
-			resource.destructor(resource.data, rs)
-			return {}, .Type_Missmatch
-		}
-
-		return add_new_slot(rs, id, resource, T)
-	case:
-		return handle, error
+@(private)
+add_new_slot :: proc(rs: ^Resource_Store, id: Rs_Id, resource: Resource, $T: typeid, status: Load_Status = .LOADED) -> (Rs_Handle(T), Resource_Error) {
+	slot: Resource_Slot = {
+		resource  = resource,
+		ref_count = 1,
+		id        = id,
+		status    = status,
 	}
+	handle, alloc_err := hm.add(&rs.handle_map, slot)
+	assert(alloc_err == nil)
+
+	added_slot, _ := hm.get(&rs.handle_map, handle)
+	rs.id_to_loaded[id] = handle
+	added_slot.handle = handle
+	return Rs_Handle(T){handle}, .None
 }
 
 @(private)
@@ -549,7 +573,10 @@ ensure_cache_id :: proc(rs: ^Resource_Store, category_id: Cache_Id, cache_max_si
 	return cache, .None
 }
 
+/*
+
 //TODO better handling here.
+*/
 resource_remove :: proc(rs: ^Resource_Store, removed_slot: ^Resource_Slot) -> Resource_Error {
 	removed_slot.destructor(removed_slot.data, rs)
 	found, _ := hm.remove(&rs.handle_map, removed_slot.handle)
