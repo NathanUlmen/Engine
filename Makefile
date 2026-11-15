@@ -16,7 +16,8 @@ clean:
 test:
 	odin test tests/unit/ -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)
 
-fzztest:
-	odin test tests/fuzz/ -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)
+test-all:
+	odin test tests/unit/ . -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)
+	odin test tests/fuzz/ . -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)
 
 
