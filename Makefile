@@ -14,7 +14,7 @@ clean:
 	rm prog; rm release
 
 test:
-	odin test tests/unit/ -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)
+	odin test tests/unit/ -out:out/unit -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)
 
 test-all:
 	odin test tests/unit/ . -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)

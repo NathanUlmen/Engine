@@ -14,22 +14,30 @@ import bits "core:math/bits"
 import "core:mem"
 import "core:path/filepath"
 
-DEFAULT_CACHE_ID :: Cache_Id(bits.U32_MAX)
+DEFAULT_CATEGORY_ID :: Category_Id(0)
 
-DEFAULT_CATEGORY :: Cache_Category{100 * mem.Megabyte, DEFAULT_CACHE_ID}
+DEFAULT_CATEGORY :: Category_Configuration{100 * mem.Megabyte, 20 * mem.Megabyte, DEFAULT_CATEGORY_ID}
 
-Cache_Id :: distinct u32
+Category_Id :: distinct u32
 
-Cache_Category :: struct {
-	max_size_bytes: u64,
-	category_id:    Cache_Id,
+/*
+Used to configure a resource category.
+    - category_budget_bytes: The budget in bytes that the given category is alloted. The Resource_Store asserts that this value is not exceeded.
+    - cache_budget_bytes: The number of bytes that can be used to cache resources in this category. Resrouces are moved to the cache when they have zero references to them. They are evicted using an LRU strategy.
+    - category_id: Denotes the category. Zero is reserved for the DEFAULT_CATEGORY.
+
+*/
+Category_Configuration :: struct {
+	category_budget_bytes: u64,
+	cache_budget_bytes:    u64,
+	category_id:           Category_Id,
 }
 
 Resource_Store :: struct {
 	marshallers:     map[string]Resource_Marshaller,
 	id_to_artifact:  map[Rs_Id]Resource_Artifact,
 	id_to_loaded:    map[Rs_Id]hm.Handle64,
-	cache_lookup:    map[Cache_Id]CacheLRU,
+	categories:      map[Category_Id]Resource_Category,
 	sys_allocator:   mem.Allocator,
 	handle_map:      hm.Dynamic_Handle_Map(Resource_Slot, hm.Handle64),
 	pool:            ^thread.Pool,
@@ -37,7 +45,7 @@ Resource_Store :: struct {
 	artficat_lock:   ^sync.RW_Mutex,
 }
 
-Resource_Error :: enum {
+Resource_Error :: enum u8 {
 	None,
 	Not_Loaded,
 	Missing_Serializer,
@@ -49,6 +57,9 @@ Resource_Error :: enum {
 	Serialization_Error,
 	Missing_File,
 	Type_Missmatch,
+	Category_Missmatch,
+	Category_Bugdet_Exceeded,
+	Missing_Category,
 }
 
 Rs_Id :: uuid.Identifier
@@ -136,6 +147,7 @@ Resource_Marshaller :: struct {
     Fields:
     - id: stable id that is associated with this resource.
     - dependencies: ResourceArtifacts of other resources that this resource depends on.
+    - category_id: Category that this resource belongs to. By default will zero initialize to the default category defined above.
     - baked_file_path: the file path to the baked resource data
     - name: Name associated with artifact
     - progenitor_file_path: path to the file that this artifact was derived/produced from.
@@ -144,14 +156,13 @@ Resource_Marshaller :: struct {
 
 */
 Resource_Artifact :: struct {
-	id:                   Rs_Id, //maybe we can handle this for the user?
-	cache_category:       Cache_Category,
+	stable_id:            Rs_Id, //maybe we can handle this for the user?
 	dependencies:         []Rs_Id,
-	type:                 string,
 	baked_file_path:      string,
 	name:                 string,
 	progenitor_file_path: string, //we can handle
 	_extension:           string, //we can handle
+	category_id:          Category_Id,
 	import_version:       u16,
 }
 
@@ -163,13 +174,21 @@ Inputs:
     - allocator: The allocator that the Resource_Store will use for all allocations.
     - thread_count: The number of threads available to use for asynchronous loading.
 */
-rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator, thread_count: int = 1) {
+rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator, categories: []Category_Configuration = nil, thread_count: int = 1) {
 	//TODO: figure out how to assert random generation is enabled/init.
 	rs.sys_allocator = allocator
 	rs.marshallers = make(map[string]Resource_Marshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[Rs_Id]Resource_Artifact, rs.sys_allocator)
 	rs.id_to_loaded = make(map[Rs_Id]hm.Handle64, rs.sys_allocator)
-	rs.cache_lookup = make(map[Cache_Id]CacheLRU)
+	rs.categories = make(map[Category_Id]Resource_Category, rs.sys_allocator)
+
+	init_categories(rs, DEFAULT_CATEGORY)
+	if categories != nil {
+		for config in categories {
+			init_categories(rs, config)
+		}
+	}
+
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 	rs.pool = new(thread.Pool)
 	thread.pool_init(rs.pool, rs.sys_allocator, thread_count)
@@ -198,7 +217,7 @@ rs_store_destroy :: proc(rs: ^Resource_Store) {
 	}
 
 	delete(rs.id_to_loaded)
-	delete(rs.cache_lookup)
+	delete(rs.categories)
 	for _, &artifact in rs.id_to_artifact {
 		artifact_destroy(rs, &artifact)
 	}
@@ -213,7 +232,6 @@ artifact_destroy :: proc(rs: ^Resource_Store, artifact: ^Resource_Artifact) {
 	delete(artifact.baked_file_path, rs.sys_allocator)
 	delete(artifact.name, rs.sys_allocator)
 	delete(artifact.progenitor_file_path, rs.sys_allocator)
-	delete(artifact.type, rs.sys_allocator)
 	delete(artifact._extension, rs.sys_allocator)
 }
 
@@ -265,10 +283,10 @@ rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: 
 	//update the extension
 	for &artifact in artifacts {
 		artifact._extension = strings.clone(extension)
-		if old, has := rs.id_to_artifact[artifact.id]; has {
+		if old, has := rs.id_to_artifact[artifact.stable_id]; has {
 			artifact_destroy(rs, &old)
 		}
-		rs.id_to_artifact[artifact.id] = artifact
+		rs.id_to_artifact[artifact.stable_id] = artifact
 	}
 
 	return .None
@@ -293,9 +311,9 @@ handle_acquire :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle
 		}
 		//our resource was in cache, we need to remove it now.
 		if target_slot.ref_count == 0 {
-			category := rs.id_to_artifact[id].cache_category
-			cache := &rs.cache_lookup[category.category_id]
-			cache_take_entry(rs, cache, target_slot)
+			category_id := rs.id_to_artifact[id].category_id
+			category := &rs.categories[category_id]
+			cache_take_entry(rs, category, target_slot)
 		}
 		target_slot.ref_count += 1
 		//should we check for overflow here?
@@ -345,10 +363,15 @@ handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_E
 		if !contained {
 			return resource_remove(rs, slot)
 		}
-		cache, err := ensure_cache(rs, artifact)
-		//TODO: handle this error better in the future
-		assert(err == .None)
-		cache_add_entry(rs, cache, slot)
+
+		category, category_contained := &rs.categories[artifact.category_id]
+		if !category_contained {
+			//TODO: might want to revist this later as error from resource_remove is not handled...
+			resource_remove(rs, slot)
+			return .Missing_Category
+		}
+
+		cache_add_entry(rs, &category.cache, slot)
 	}
 	return .None
 }
@@ -403,6 +426,16 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 
 		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
+		category := &rs.categories[artifact.category_id]
+
+
+		over_budget := category.current_size_bytes + resource.data_size_bytes > category.budget_bytes
+		fmt.assertf(!over_budget, "Budget of %v bytes for Category with id %v exceeded.", category.budget_bytes, category.category_id)
+		// if over_budget {
+		// 	resource.destructor(resource.data, rs)
+		// 	return {}, .Category_Bugdet_Exceeded
+		// }
+
 
 		if T != resource.type {
 			resource.destructor(resource.data, rs)
@@ -550,27 +583,16 @@ add_new_slot :: proc(rs: ^Resource_Store, id: Rs_Id, resource: Resource, $T: typ
 	return Rs_Handle(T){handle}, .None
 }
 
-@(private)
-ensure_cache :: proc {
-	ensure_cache_artifact,
-	ensure_cache_id,
-}
 
 @(private)
-ensure_cache_artifact :: proc(rs: ^Resource_Store, artifact: Resource_Artifact) -> (^CacheLRU, Resource_Error) {
-	return ensure_cache_id(rs, artifact.cache_category.category_id, artifact.cache_category.max_size_bytes)
-}
-
-@(private)
-ensure_cache_id :: proc(rs: ^Resource_Store, category_id: Cache_Id, cache_max_size_bytes: u64) -> (^CacheLRU, Resource_Error) {
-	cache, cache_contained := &rs.cache_lookup[category_id]
-	if !cache_contained {
-		c := CacheLRU{}
-		cache_init(&c, cache_max_size_bytes)
-		rs.cache_lookup[category_id] = c
-		return &rs.cache_lookup[category_id], .None
+init_categories :: proc(rs: ^Resource_Store, config: Category_Configuration) {
+	category: Resource_Category = {
+		category_id          = config.category_id,
+		budget_bytes         = config.category_budget_bytes,
+		cache_max_size_bytes = config.cache_budget_bytes,
 	}
-	return cache, .None
+	rs.categories[config.category_id] = category
+	cache_init(&rs.categories[config.category_id], config.cache_budget_bytes)
 }
 
 /*
@@ -612,41 +634,50 @@ Requirements:
 - dynamic/adjustable max size
 
 */
-CacheLRU :: struct {
+
+Resource_Category :: struct {
+	budget_bytes:       u64,
 	current_size_bytes: u64,
-	max_capacity_bytes: u64,
-	linked_list:        list.List,
+	using cache:        CacheLRU,
+	category_id:        Category_Id,
+}
+
+
+CacheLRU :: struct {
+	cache_current_size_bytes: u64,
+	cache_max_size_bytes:     u64,
+	linked_list:              list.List,
 }
 
 cache_init :: proc(cache: ^CacheLRU, max_size_bytes: u64) {
-	cache.max_capacity_bytes = max_size_bytes
-	cache.current_size_bytes = 0
+	cache.cache_max_size_bytes = max_size_bytes
+	cache.cache_current_size_bytes = 0
 }
 
 cache_add_entry :: proc(rs: ^Resource_Store, cache: ^CacheLRU, slot: ^Resource_Slot) {
-	cache.current_size_bytes += slot.data_size_bytes
+	cache.cache_current_size_bytes += slot.data_size_bytes
 	list.push_front(&cache.linked_list, &slot.node)
 	cache_ensure_limit(rs, cache)
 }
 
 cache_take_entry :: proc(rs: ^Resource_Store, cache: ^CacheLRU, slot: ^Resource_Slot) {
-	cache.current_size_bytes -= slot.data_size_bytes
+	cache.cache_current_size_bytes -= slot.data_size_bytes
 	list.remove(&cache.linked_list, &slot.node)
 }
 
 cache_ensure_limit :: proc(rs: ^Resource_Store, cache: ^CacheLRU) {
-	for cache.current_size_bytes > cache.max_capacity_bytes {
+	for cache.cache_current_size_bytes > cache.cache_max_size_bytes {
 		removed_node := list.pop_back(&cache.linked_list)
 		assert(removed_node != nil)
 		removed_slot := container_of(removed_node, Resource_Slot, "node")
 		err := resource_remove(rs, removed_slot)
 		assert(err == .None)
-		cache.current_size_bytes -= removed_slot.data_size_bytes
+		cache.cache_current_size_bytes -= removed_slot.data_size_bytes
 	}
 }
 
-cache_configure :: proc(rs: ^Resource_Store, cache_id: Cache_Id, max_size_bytes: u64) {
-	cache, _ := &rs.cache_lookup[cache_id]
-	cache.max_capacity_bytes = max_size_bytes
+cache_configure :: proc(rs: ^Resource_Store, cache_id: Category_Id, max_size_bytes: u64) {
+	cache, _ := &rs.categories[cache_id]
+	cache.cache_max_size_bytes = max_size_bytes
 	cache_ensure_limit(rs, cache)
 }

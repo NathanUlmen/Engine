@@ -234,15 +234,15 @@ test_cache_resize :: proc(t: ^testing.T) {
 	}
 
 	//test that cache_resize to larger size is non-destructive and that values are set
-	old_size := rs.cache_lookup[src.TEXT_CACHE_CATEGORY].current_size_bytes
+	old_size := rs.categories[src.TEXT_CATEGORY].cache_current_size_bytes
 	old_loaded := len(rs.id_to_loaded)
 	src.cache_configure(rs, 0, 2048)
-	testing.expect(t, rs.cache_lookup[src.TEXT_CACHE_CATEGORY].current_size_bytes == old_size)
-	testing.expect(t, rs.cache_lookup[src.TEXT_CACHE_CATEGORY].max_capacity_bytes == 2048)
+	testing.expect(t, rs.categories[src.TEXT_CATEGORY].cache_current_size_bytes == old_size)
+	testing.expect(t, rs.categories[src.TEXT_CATEGORY].cache_max_size_bytes == 2048)
 	testing.expect(t, len(rs.id_to_loaded) == old_loaded)
 
 	//assert that a cache-resize to zero evicts all entries
-	src.cache_configure(rs, src.TEXT_CACHE_CATEGORY, 0)
+	src.cache_configure(rs, src.TEXT_CATEGORY, 0)
 
 	//assert that items were deleted.
 	testing.expect(t, len(rs.id_to_loaded) == 0)
