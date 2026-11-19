@@ -14,17 +14,14 @@ import bits "core:math/bits"
 import "core:mem"
 import "core:path/filepath"
 
-DEFAULT_CATEGORY_ID :: Category_Id(0)
 
-DEFAULT_CATEGORY :: Category_Configuration{100 * mem.Megabyte, 20 * mem.Megabyte, DEFAULT_CATEGORY_ID}
-
-Category_Id :: distinct u32
+Category_Id :: u32
 
 /*
 Used to configure a resource category.
     - category_budget_bytes: The budget in bytes that the given category is alloted. The Resource_Store asserts that this value is not exceeded.
     - cache_budget_bytes: The number of bytes that can be used to cache resources in this category. Resrouces are moved to the cache when they have zero references to them. They are evicted using an LRU strategy.
-    - category_id: Denotes the category. Zero is reserved for the DEFAULT_CATEGORY.
+    - category_id: Denotes the category. It's recommended to use an enum for this.
 
 */
 Category_Configuration :: struct {
@@ -32,6 +29,7 @@ Category_Configuration :: struct {
 	cache_budget_bytes:    u64,
 	category_id:           Category_Id,
 }
+
 
 Resource_Store :: struct {
 	marshallers:     map[string]Resource_Marshaller,
@@ -65,7 +63,7 @@ Resource_Error :: enum u8 {
 Rs_Id :: uuid.Identifier
 
 Rs_Handle :: struct($T: typeid) {
-	handle: hm.Handle64,
+	using handle: hm.Handle64,
 }
 
 Resource :: struct {
@@ -182,7 +180,6 @@ rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator, categories:
 	rs.id_to_loaded = make(map[Rs_Id]hm.Handle64, rs.sys_allocator)
 	rs.categories = make(map[Category_Id]Resource_Category, rs.sys_allocator)
 
-	init_categories(rs, DEFAULT_CATEGORY)
 	if categories != nil {
 		for config in categories {
 			init_categories(rs, config)
@@ -331,7 +328,7 @@ Copies a handle to a resource, incrementing the ref_count in the process.
     - a copied resource handle that is reference counted
 */
 handle_duplicate :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Handle(T), Resource_Error) {
-	result, ok := hm.get(&rs.handle_map, handle.handle)
+	result, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return Rs_Handle(T){}, .Handle_Error
 	}
@@ -348,7 +345,7 @@ handle_duplicate :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Hand
     - err:
 */
 handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_Error {
-	slot, ok := hm.get(&rs.handle_map, handle.handle)
+	slot, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return .Handle_Error
 	}
@@ -385,7 +382,7 @@ Resolves/dereferrences what ever the resource handle points to, this is used to 
     - rawptr: pointer to the actual data stored inside the store 
 */
 handle_resolve :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (^T, Resource_Error) {
-	slot, ok := hm.get(&rs.handle_map, handle.handle)
+	slot, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return nil, .Handle_Error
 	}
@@ -431,10 +428,6 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 
 		over_budget := category.current_size_bytes + resource.data_size_bytes > category.budget_bytes
 		fmt.assertf(!over_budget, "Budget of %v bytes for Category with id %v exceeded.", category.budget_bytes, category.category_id)
-		// if over_budget {
-		// 	resource.destructor(resource.data, rs)
-		// 	return {}, .Category_Bugdet_Exceeded
-		// }
 
 
 		if T != resource.type {
@@ -475,7 +468,7 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 	//TODO: handlde error better.
 	assert(err == .None)
 
-	reserved_slot := hm.get(&rs.handle_map, new_slot_handle.handle)
+	reserved_slot := hm.get(&rs.handle_map, new_slot_handle)
 
 
 	//2. Start loading of our resrouce
@@ -612,6 +605,17 @@ resource_remove :: proc(rs: ^Resource_Store, removed_slot: ^Resource_Slot) -> Re
 /*
 
 */
+id_from_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle(any)) -> (Rs_Id, Resource_Error) {
+	slot, contained := hm.get(&rs.handle_map, handle)
+	if !contained {
+		return {}, .Handle_Error
+	}
+	return slot.id, .None
+}
+
+/*
+
+*/
 artifacts_write_to_disk :: proc(rs: Resource_Store, output_path: string) -> Resource_Error {
 	panic("TODO write_registry_to_disk Unimplemented")
 }
@@ -623,7 +627,27 @@ artifacts_read_from_disk :: proc(rs: ^Resource_Store, file_path: string) -> Reso
 	panic("TODO read_reg_from_disk Unimplemented")
 }
 
-//-------CACHE-------------
+
+/*
+
+*/
+cache_clean :: proc(rs: ^Resource_Store, target_category: Category_Id) {
+	category, contained := &rs.categories[target_category]
+	assert(contained)
+	cache_ensure_limit(rs, &category.cache, 0)
+}
+
+/*
+
+*/
+cache_resize :: proc(rs: ^Resource_Store, target_category: Category_Id, new_size_bytes: u64) {
+	category, contained := &rs.categories[target_category]
+	assert(contained)
+	category.cache_max_size_bytes = new_size_bytes
+	cache_ensure_limit(rs, &category.cache)
+}
+
+//-------CACHE IMPLEMENTATION-------------
 
 
 /*
@@ -665,8 +689,13 @@ cache_take_entry :: proc(rs: ^Resource_Store, cache: ^CacheLRU, slot: ^Resource_
 	list.remove(&cache.linked_list, &slot.node)
 }
 
-cache_ensure_limit :: proc(rs: ^Resource_Store, cache: ^CacheLRU) {
-	for cache.cache_current_size_bytes > cache.cache_max_size_bytes {
+cache_ensure_limit :: proc {
+	cache_ensure_limit_max_size,
+	cache_ensure_limit_to_size,
+}
+
+cache_ensure_limit_to_size :: proc(rs: ^Resource_Store, cache: ^CacheLRU, target_size: u64) {
+	for cache.cache_current_size_bytes > target_size {
 		removed_node := list.pop_back(&cache.linked_list)
 		assert(removed_node != nil)
 		removed_slot := container_of(removed_node, Resource_Slot, "node")
@@ -674,6 +703,10 @@ cache_ensure_limit :: proc(rs: ^Resource_Store, cache: ^CacheLRU) {
 		assert(err == .None)
 		cache.cache_current_size_bytes -= removed_slot.data_size_bytes
 	}
+}
+
+cache_ensure_limit_max_size :: proc(rs: ^Resource_Store, cache: ^CacheLRU) {
+	cache_ensure_limit_to_size(rs, cache, cache.cache_max_size_bytes)
 }
 
 cache_configure :: proc(rs: ^Resource_Store, cache_id: Category_Id, max_size_bytes: u64) {

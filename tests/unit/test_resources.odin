@@ -13,7 +13,8 @@ import "core:testing"
 
 create_test_rs_store :: proc() -> ^src.Resource_Store {
 	rs := new(src.Resource_Store)
-	src.rs_store_init(rs, context.allocator)
+	categories := []src.Category_Configuration{{100 * mem.Megabyte, 20 * mem.Megabyte, 0}}
+	src.rs_store_init(rs, context.allocator, categories)
 	return rs
 }
 
