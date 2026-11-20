@@ -285,7 +285,7 @@ rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: 
 
 	//update the extension for the user.
 	for &artifact in artifacts {
-		artifact._extension = strings.clone(extension)
+		artifact._extension = strings.clone(extension, rs.sys_allocator)
 		if old, has := rs.id_to_artifact[artifact.stable_id]; has {
 			artifact_destroy(rs, &old)
 		}
@@ -316,6 +316,7 @@ handle_acquire :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle
 		if target_slot.ref_count == 0 {
 			category_id := rs.id_to_artifact[id].category_id
 			category := &rs.categories[category_id]
+			category.current_size_bytes += target_slot.data_size_bytes
 			cache_take_entry(rs, category, target_slot)
 		}
 		target_slot.ref_count += 1
