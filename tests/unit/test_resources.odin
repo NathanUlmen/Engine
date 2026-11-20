@@ -339,7 +339,6 @@ test_fails_when_category_budget_exceeded :: proc(t: ^testing.T) {
 	}
 
 	testing.expect_assert(t, "Budget size exceeded after resize.")
-	log.info("Byte size!", rs.categories[DEFAULT_CATEGORY].current_size_bytes)
 	testing.cleanup(t, cleanup_rs_store, rs)
 	src.category_resize(rs, DEFAULT_CATEGORY, 1)
 }
@@ -407,6 +406,7 @@ test_category_byte_counts_accurate :: proc(t: ^testing.T) {
 
 	i: u64 = 0 //our resources are all 1 byte in size. Also use this as our index
 	handles := make([]src.Rs_Handle(string), len(rs.id_to_artifact))
+	defer delete(handles)
 	for id, _ in rs.id_to_artifact {
 		handle, _ := src.resource_load(rs, id, string)
 		testing.expect(t, rs.categories[DEFAULT_CATEGORY].current_size_bytes == i + 1)

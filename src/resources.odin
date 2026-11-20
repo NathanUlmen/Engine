@@ -429,17 +429,17 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 
 		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
-		category := &rs.categories[artifact.category_id]
-
-		category.current_size_bytes += resource.data_size_bytes
-		over_budget := category.current_size_bytes > category.budget_bytes
-		fmt.assertf(!over_budget, "Budget of %v bytes for Category with id %v exceeded.", category.budget_bytes, category.category_id)
-
 
 		if T != resource.type {
 			resource.destructor(resource.data, rs)
 			return {}, .Type_Missmatch
 		}
+
+		category, contained := &rs.categories[artifact.category_id]
+		assert(contained)
+		category.current_size_bytes += resource.data_size_bytes
+		over_budget := category.current_size_bytes > category.budget_bytes
+		fmt.assertf(!over_budget, "Budget of %v bytes for Category with id %v exceeded.", category.budget_bytes, category.category_id)
 
 		return add_new_slot(rs, id, resource, T)
 	case:
@@ -548,6 +548,9 @@ moment their ref_count hits 0.
 */
 resource_register :: proc(rs: ^Resource_Store, to_register: Resource, $T: typeid) -> (Rs_Handle(T), Resource_Error) {
 	id := uuid.generate_v7(nil)
+	if to_register.type != T {
+		return {}, .Type_Missmatch
+	}
 	slot_handle, err := add_new_slot(rs, id, to_register, T)
 	if err != .None {
 		return {}, err
@@ -660,7 +663,7 @@ category_resize :: proc(rs: ^Resource_Store, target_category: Category_Id, new_s
 	category, contained := &rs.categories[target_category]
 	assert(contained)
 	category.budget_bytes = new_size_bytes
-	assert(category.current_size_bytes < category.budget_bytes, "Budget size exceeded after resize.")
+	assert(category.current_size_bytes <= category.budget_bytes, "Budget size exceeded after resize.")
 }
 
 //-------CACHE IMPLEMENTATION-------------
