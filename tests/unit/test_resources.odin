@@ -1,5 +1,6 @@
 package tests
 import "../../src"
+import "base:runtime"
 import "core:c/libc/tests"
 import hm "core:container/handle_map"
 import "core:crypto"
@@ -11,20 +12,27 @@ import "core:strings"
 import "core:sync"
 import "core:testing"
 
+DEFAULT_CATEGORY :: src.Category_Id(0)
+
 create_test_rs_store :: proc() -> ^src.Resource_Store {
 	rs := new(src.Resource_Store)
-	categories := []src.Category_Configuration{{100 * mem.Megabyte, 20 * mem.Megabyte, 0}}
+	categories := []src.Category_Configuration{{100 * mem.Megabyte, 20 * mem.Megabyte, DEFAULT_CATEGORY}}
 	src.rs_store_init(rs, context.allocator, categories)
 	return rs
 }
 
 init_rs_store_with_txt_serializer :: proc() -> ^src.Resource_Store {
-	context.random_generator = crypto.random_generator()
 	rs := create_test_rs_store()
 	src.rs_store_register_marshaller(rs, src.default_txt_serializer())
 	return rs
 }
 
+init_rs_store_with_data :: proc() -> ^src.Resource_Store {
+	rs := init_rs_store_with_txt_serializer()
+	err := src.rs_store_import_file(rs, "testData.txt")
+	assert(err == .None)
+	return rs
+}
 
 ref_count :: proc(rs: ^src.Resource_Store, id: src.Rs_Id) -> u32 {
 	return hm.get(&rs.handle_map, rs.id_to_loaded[id]).ref_count
@@ -39,14 +47,12 @@ cleanup_rs_store :: proc(data: rawptr) {
 @(test)
 test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-	rs := init_rs_store_with_txt_serializer()
-	src.rs_store_import_file(rs, "testData.txt")
+	rs := init_rs_store_with_data()
 
 	file_bytes, _ := os.read_entire_file("testData.txt", context.allocator)
 	defer {
-		src.rs_store_destroy(rs)
 		delete(file_bytes)
-		free(rs)
+		cleanup_rs_store(rs)
 	}
 
 	string_data := strings.split_lines(string(file_bytes))
@@ -85,13 +91,10 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 @(test)
 test_invalid_free :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-	rs := init_rs_store_with_txt_serializer()
+	rs := init_rs_store_with_data()
 	defer {
-		src.rs_store_destroy(rs)
-		free(rs)
+		cleanup_rs_store(rs)
 	}
-	err := src.rs_store_import_file(rs, "testData.txt")
-	testing.expect(t, err == .None)
 
 	testing.cleanup(t, cleanup_rs_store, rs)
 	for id, _ in rs.id_to_artifact {
@@ -112,14 +115,10 @@ test_invalid_free :: proc(t: ^testing.T) {
 @(test)
 test_acquire_loaded_resource :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-	rs := init_rs_store_with_txt_serializer()
+	rs := init_rs_store_with_data()
 	defer {
-		src.rs_store_destroy(rs)
-		free(rs)
+		cleanup_rs_store(rs)
 	}
-
-	err := src.rs_store_import_file(rs, "testData.txt")
-	testing.expect(t, err == .None)
 
 	for id, _ in rs.id_to_artifact {
 		_, err := src.handle_acquire(rs, id, string)
@@ -144,14 +143,10 @@ test_acquire_loaded_resource :: proc(t: ^testing.T) {
 @(test)
 test_duplicate_handle :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-	rs := init_rs_store_with_txt_serializer()
+	rs := init_rs_store_with_data()
 	defer {
-		src.rs_store_destroy(rs)
-		free(rs)
+		cleanup_rs_store(rs)
 	}
-
-	err := src.rs_store_import_file(rs, "testData.txt")
-	testing.expect(t, err == .None)
 
 	for id, _ in rs.id_to_artifact {
 		_, err := src.handle_duplicate(rs, src.Rs_Handle(string){})
@@ -189,15 +184,10 @@ test_invalid_id :: proc(t: ^testing.T) {
 @(test)
 test_type_validation :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-	rs := init_rs_store_with_txt_serializer()
+	rs := init_rs_store_with_data()
 	defer {
-		src.rs_store_destroy(rs)
-		free(rs)
+		cleanup_rs_store(rs)
 	}
-
-	err := src.rs_store_import_file(rs, "testData.txt")
-	testing.expect(t, err == .None)
-
 
 	for id, _ in rs.id_to_artifact {
 		bad_handle, err := src.resource_load(rs, id, bool)
@@ -209,12 +199,10 @@ test_type_validation :: proc(t: ^testing.T) {
 @(test)
 test_cache_resize :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-	rs := init_rs_store_with_txt_serializer()
+	rs := init_rs_store_with_data()
 	defer {
-		src.rs_store_destroy(rs)
-		free(rs)
+		cleanup_rs_store(rs)
 	}
-	src.rs_store_import_file(rs, "testData.txt")
 
 	//iterate through and move everything to cache
 	for id, _ in rs.id_to_artifact {
@@ -252,15 +240,12 @@ test_cache_resize :: proc(t: ^testing.T) {
 @(test)
 test_async_loading :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
-	rs := init_rs_store_with_txt_serializer()
+	rs := init_rs_store_with_data()
 	cb_data := new(int)
 	defer {
-		src.rs_store_destroy(rs)
-		free(rs)
+		cleanup_rs_store(rs)
 		free(cb_data)
 	}
-
-	src.rs_store_import_file(rs, "testData.txt")
 
 	Data :: struct {
 		count: ^int,
@@ -340,4 +325,81 @@ test_resource_register :: proc(t: ^testing.T) {
 	testing.expect(t, src.handle_release(rs, registered_handle) == .None)
 
 	testing.expect(t, len(rs.id_to_loaded) == 0)
+}
+
+@(test)
+test_fails_when_category_budget_exceeded :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rs_store_with_data()
+	defer {
+		cleanup_rs_store(rs)
+	}
+
+	for id, _ in rs.id_to_artifact {
+		src.resource_load(rs, id, string)
+	}
+
+	testing.expect_assert(t, "Budget size exceeded after resize.")
+	testing.cleanup(t, cleanup_rs_store, rs)
+	src.category_resize(rs, DEFAULT_CATEGORY, 1)
+}
+
+@(test)
+test_cache_clean :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rs_store_with_data()
+	defer {
+		cleanup_rs_store(rs)
+	}
+
+	handles := make([]src.Rs_Handle(string), len(rs.id_to_artifact))
+	defer delete(handles)
+	i := 0
+	for id, _ in rs.id_to_artifact {
+		handle, _ := src.resource_load(rs, id, string)
+		handles[i] = handle
+		i += 1
+	}
+
+
+	for handle in handles {
+		src.handle_release(rs, handle)
+	}
+	loaded := len(rs.id_to_loaded)
+	testing.expect(t, loaded == len(rs.id_to_artifact))
+	src.cache_clean(rs, DEFAULT_CATEGORY)
+	testing.expect(t, len(rs.id_to_loaded) == 0)
+	testing.expect(t, rs.categories[DEFAULT_CATEGORY].cache_current_size_bytes == 0)
+}
+
+@(test)
+test_category_resize :: proc(t: ^testing.T) {
+
+}
+
+@(test)
+test_error_on_missing_file :: proc(t: ^testing.T) {
+
+}
+
+@(test)
+test_fails_when_resource_size_zero :: proc(t: ^testing.T) {
+
+}
+
+@(test)
+test_id_from_handle :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rs_store_with_data()
+	defer {
+		cleanup_rs_store(rs)
+	}
+
+	for id, _ in rs.id_to_artifact {
+		handle, err := src.resource_load(rs, id, string)
+		testing.expect(t, err == .None)
+		id_from_handle, handle_err := src.id_from_handle(rs, handle)
+		testing.expect(t, handle_err == .None)
+		testing.expect(t, id == id_from_handle)
+	}
 }

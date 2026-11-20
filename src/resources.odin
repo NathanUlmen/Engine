@@ -4,6 +4,7 @@ import hm "core:container/handle_map"
 import list "core:container/intrusive/list"
 import "core:encoding/uuid"
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -137,8 +138,8 @@ An "interface" used by the ResourceStore.
 Resource_Marshaller :: struct {
 	using serializer_context: Marshaller_Context,
 	extension:                string,
-	import_resource:          proc(user_data: rawptr, file_path: string, allocator: mem.Allocator) -> (a: []Resource_Artifact, ok: bool),
-	create_resource:          proc(user_data: rawptr, file_path: string, rsrc_sys: ^Resource_Store, allocator: mem.Allocator) -> Resource,
+	import_resource:          proc(user_data: rawptr, file_path: string, store_allocator: mem.Allocator) -> (a: []Resource_Artifact, ok: bool),
+	create_resource:          proc(user_data: rawptr, file_path: string, rs: ^Resource_Store, store_allocator: mem.Allocator) -> Resource,
 }
 
 /*
@@ -246,6 +247,7 @@ rs_store_register_marshaller :: proc(rs: ^Resource_Store, serializer: Resource_M
 			log.warnf("Replaced existing serializer responsible for extension %v", serializer.extension)
 		}
 	}
+	assert(len(serializer.extension) > 0)
 	to_replace, contained := rs.marshallers[serializer.extension]
 	if contained {
 		to_replace.destroy_serializer_context(to_replace.user_data, rs.sys_allocator)
@@ -269,7 +271,11 @@ rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: 
 	extension := filepath.ext(target_file)
 	serializer, contains := rs.marshallers[extension]
 	if !contains {
-		return Resource_Error.Missing_Serializer
+		return .Missing_Serializer
+	}
+
+	if !os.exists(target_file) {
+		return .Missing_File
 	}
 
 	artifacts, ok := serializer.import_resource(serializer.user_data, target_file, rs.sys_allocator)
@@ -277,7 +283,7 @@ rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: 
 		return .Serialization_Error
 	}
 
-	//update the extension
+	//update the extension for the user.
 	for &artifact in artifacts {
 		artifact._extension = strings.clone(extension)
 		if old, has := rs.id_to_artifact[artifact.stable_id]; has {
@@ -605,7 +611,7 @@ resource_remove :: proc(rs: ^Resource_Store, removed_slot: ^Resource_Slot) -> Re
 /*
 
 */
-id_from_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle(any)) -> (Rs_Id, Resource_Error) {
+id_from_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Id, Resource_Error) {
 	slot, contained := hm.get(&rs.handle_map, handle)
 	if !contained {
 		return {}, .Handle_Error
@@ -645,6 +651,13 @@ cache_resize :: proc(rs: ^Resource_Store, target_category: Category_Id, new_size
 	assert(contained)
 	category.cache_max_size_bytes = new_size_bytes
 	cache_ensure_limit(rs, &category.cache)
+}
+
+category_resize :: proc(rs: ^Resource_Store, target_category: Category_Id, new_size_bytes: u64) {
+	category, contained := &rs.categories[target_category]
+	assert(contained)
+	category.budget_bytes = new_size_bytes
+	assert(category.current_size_bytes > category.budget_bytes, "Budget size exceeded after resize.")
 }
 
 //-------CACHE IMPLEMENTATION-------------
