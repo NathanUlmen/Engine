@@ -119,7 +119,6 @@ test_acquire_loaded_resource :: proc(t: ^testing.T) {
 	defer {
 		cleanup_rs_store(rs)
 	}
-
 	for id, _ in rs.id_to_artifact {
 		_, err := src.handle_acquire(rs, id, string)
 		testing.expect(t, err == .Not_Loaded)
@@ -340,6 +339,7 @@ test_fails_when_category_budget_exceeded :: proc(t: ^testing.T) {
 	}
 
 	testing.expect_assert(t, "Budget size exceeded after resize.")
+	log.info("Byte size!", rs.categories[DEFAULT_CATEGORY].current_size_bytes)
 	testing.cleanup(t, cleanup_rs_store, rs)
 	src.category_resize(rs, DEFAULT_CATEGORY, 1)
 }
@@ -374,16 +374,53 @@ test_cache_clean :: proc(t: ^testing.T) {
 
 @(test)
 test_category_resize :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rs_store_with_data()
+	defer cleanup_rs_store(rs)
 
+	// src.category_resize(rs, DEFAULT_CATEGORY, 2000)
+	// testing.expect(t, rs.categories[DEFAULT_CATEGORY].budget_bytes == 2000)
 }
 
 @(test)
 test_error_on_missing_file :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rs_store_with_txt_serializer()
+	defer {
+		cleanup_rs_store(rs)
+	}
 
+	err := src.rs_store_import_file(rs, "foobar.txt")
+	testing.expect(t, err == .Missing_File)
 }
 
 @(test)
 test_fails_when_resource_size_zero :: proc(t: ^testing.T) {
+
+}
+
+@(test)
+test_category_byte_counts_accurate :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs := init_rs_store_with_data()
+	defer cleanup_rs_store(rs)
+
+	i: u64 = 0 //our resources are all 1 byte in size. Also use this as our index
+	handles := make([]src.Rs_Handle(string), len(rs.id_to_artifact))
+	for id, _ in rs.id_to_artifact {
+		handle, _ := src.resource_load(rs, id, string)
+		testing.expect(t, rs.categories[DEFAULT_CATEGORY].current_size_bytes == i + 1)
+		handles[i] = handle
+		i += 1
+	}
+	starting_size := rs.categories[DEFAULT_CATEGORY].current_size_bytes
+	i = 1
+	for handle in handles {
+		src.handle_release(rs, handle)
+		testing.expect(t, rs.categories[DEFAULT_CATEGORY].current_size_bytes == starting_size - i)
+		testing.expect(t, rs.categories[DEFAULT_CATEGORY].cache_current_size_bytes == i)
+		i += 1
+	}
 
 }
 

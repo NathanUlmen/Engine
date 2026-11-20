@@ -373,7 +373,7 @@ handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_E
 			resource_remove(rs, slot)
 			return .Missing_Category
 		}
-
+		category.current_size_bytes -= slot.resource.data_size_bytes
 		cache_add_entry(rs, &category.cache, slot)
 	}
 	return .None
@@ -431,8 +431,8 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
 		category := &rs.categories[artifact.category_id]
 
-
-		over_budget := category.current_size_bytes + resource.data_size_bytes > category.budget_bytes
+		category.current_size_bytes += resource.data_size_bytes
+		over_budget := category.current_size_bytes > category.budget_bytes
 		fmt.assertf(!over_budget, "Budget of %v bytes for Category with id %v exceeded.", category.budget_bytes, category.category_id)
 
 
@@ -493,12 +493,13 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 		marshaller: Resource_Marshaller,
 		rs:         ^Resource_Store,
 		slot:       ^Resource_Slot,
+		category:   Category_Id,
 		cb:         Resource_Callback,
 		dispatcher: Dispatcher,
 	}
 
 	bar := new(Bar)
-	bar^ = {artifact.baked_file_path, marshaller, rs, reserved_slot, callback, cb_dispatcher}
+	bar^ = {artifact.baked_file_path, marshaller, rs, reserved_slot, artifact.category_id, callback, cb_dispatcher}
 
 	foo :: proc(task: thread.Task) {
 		casted := cast(^Bar)task.data
@@ -507,6 +508,8 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 		//TODO: update create_resource to have the ability to return an error
 		resource := casted.marshaller.create_resource(casted.marshaller.user_data, casted.file_path, casted.rs, casted.rs.sys_allocator)
 		assert(resource.data != nil)
+
+		//TODO: update current_size_bytes
 
 		//insert resource into slot
 		casted.slot.resource = resource
@@ -657,7 +660,7 @@ category_resize :: proc(rs: ^Resource_Store, target_category: Category_Id, new_s
 	category, contained := &rs.categories[target_category]
 	assert(contained)
 	category.budget_bytes = new_size_bytes
-	assert(category.current_size_bytes > category.budget_bytes, "Budget size exceeded after resize.")
+	assert(category.current_size_bytes < category.budget_bytes, "Budget size exceeded after resize.")
 }
 
 //-------CACHE IMPLEMENTATION-------------
