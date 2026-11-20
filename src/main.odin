@@ -40,5 +40,10 @@ main :: proc() {
 	}
 	log.info(args)
 
+	app: Application
+	application_init(&app)
+
+	loop(&app)
+
 
 }

@@ -4,6 +4,9 @@ TEST_THREAD_COUNT := 1
 check:
 	odin check src $(VET_FLAGS) 
 
+run:
+	odin run src/ -out:out/main -debug $(VET_FLAGS)
+
 build:
 	odin build src/ -o:speed -out:prog $(VET_FLAGS)
 
