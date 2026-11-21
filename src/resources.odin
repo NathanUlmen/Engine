@@ -4,6 +4,8 @@ import hm "core:container/handle_map"
 import list "core:container/intrusive/list"
 import "core:encoding/uuid"
 import "core:fmt"
+import "core:math/bits"
+_ :: bits
 import "core:os"
 import "core:strings"
 import "core:sync"

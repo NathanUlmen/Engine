@@ -37,13 +37,36 @@ main :: proc() {
 			}
 			mem.tracking_allocator_destroy(tracker)
 		}
+
 	}
+
 	log.info(args)
 
 	app: Application
+	game := new(Game(Game_Context))
+	game^ = {{}, nil, nil, update, nil}
+	defer game.game_destroy()
 	application_init(&app)
 
-	loop(&app)
+	//run user code
+	loop(&app, game)
+
+}
+
+Game_Context :: struct {
+	rs: Resource_Store,
+}
+
+update :: proc(app: ^Application, deltaT: f32, foo: ^Game_Context) -> (ok: bool) {
+	if is_just_pressed(app, .W) do log.info("W is pressed")
+	if is_just_pressed(app, .A) do log.info("A is pressed")
+	if is_just_pressed(app, .S) do log.info("S is pressed")
+	if is_just_pressed(app, .D) do log.info("D is pressed")
+
+	if is_pressed(app, .MOUSE_LEFT) do log.info("M1 is held")
+
+	if is_just_pressed(app, .R) do log.info("Fps", app.graphics.fps)
 
 
+	return true
 }
