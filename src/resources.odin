@@ -19,6 +19,8 @@ import "core:path/filepath"
 
 Category_Id :: u32
 
+HM_SEGMENTS :: 512
+
 /*
 Used to configure a resource category.
     - category_budget_bytes: The budget in bytes that the given category is alloted. The Resource_Store asserts that this value is not exceeded.
@@ -34,15 +36,18 @@ Category_Configuration :: struct {
 
 
 Resource_Store :: struct {
-	marshallers:     map[string]Resource_Marshaller,
-	id_to_artifact:  map[Rs_Id]Resource_Artifact,
-	id_to_loaded:    map[Rs_Id]hm.Handle64,
-	categories:      map[Category_Id]Resource_Category,
-	sys_allocator:   mem.Allocator,
-	handle_map:      hm.Dynamic_Handle_Map(Resource_Slot, hm.Handle64),
-	pool:            ^thread.Pool,
-	marshaller_lock: ^sync.RW_Mutex,
-	artficat_lock:   ^sync.RW_Mutex,
+	marshallers:       map[string]Resource_Marshaller,
+	id_to_artifact:    map[Rs_Id]Resource_Artifact,
+	id_to_loaded:      map[Rs_Id]hm.Handle64,
+	categories:        map[Category_Id]Resource_Category,
+	sys_allocator:     mem.Allocator,
+	handle_map:        hm.Dynamic_Handle_Map(Resource_Slot, hm.Handle64),
+	pool:              ^thread.Pool,
+	marshaller_lock:   sync.RW_Mutex,
+	artficats_lock:    sync.RW_Mutex,
+	loaded_lock:       sync.RW_Mutex,
+	categories_lock:   sync.RW_Mutex,
+	hm_lock_fragments: [HM_SEGMENTS]sync.RW_Mutex,
 }
 
 Resource_Error :: enum u8 {
@@ -182,6 +187,7 @@ rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator, categories:
 	rs.id_to_loaded = make(map[Rs_Id]hm.Handle64, rs.sys_allocator)
 	rs.categories = make(map[Category_Id]Resource_Category, rs.sys_allocator)
 
+
 	if categories != nil {
 		for config in categories {
 			init_categories(rs, config)
@@ -307,17 +313,30 @@ relatively expensive compared to handle_duplicate.
     - Resource_Error: 
 */
 handle_acquire :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(T), Resource_Error) {
+	sync.rw_mutex_shared_lock(&rs.loaded_lock)
 	handle := rs.id_to_loaded[id]
+	sync.rw_mutex_shared_unlock(&rs.loaded_lock)
+
+
+	sync.rw_mutex_lock(get_lock_seg(rs, handle))
 	target_slot, contained := hm.get(&rs.handle_map, handle)
+	defer sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 	if contained && target_slot.status == .LOADED {
 		if target_slot.type != T {
 			return {}, .Type_Missmatch
 		}
+
 		//our resource was in cache, we need to remove it now.
 		if target_slot.ref_count == 0 {
+			sync.rw_mutex_shared_lock(&rs.artficats_lock)
 			category_id := rs.id_to_artifact[id].category_id
+			sync.rw_mutex_shared_unlock(&rs.artficats_lock)
+
+			sync.rw_mutex_lock(&rs.categories_lock)
 			category := &rs.categories[category_id]
 			category.current_size_bytes += target_slot.data_size_bytes
+			sync.rw_mutex_unlock(&rs.categories_lock)
+
 			cache_take_entry(rs, category, target_slot)
 		}
 		target_slot.ref_count += 1
@@ -336,6 +355,8 @@ Copies a handle to a resource, incrementing the ref_count in the process.
     - a copied resource handle that is reference counted
 */
 handle_duplicate :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Handle(T), Resource_Error) {
+	sync.rw_mutex_lock(get_lock_seg(rs, handle))
+	defer sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 	result, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return Rs_Handle(T){}, .Handle_Error
@@ -390,6 +411,9 @@ Resolves/dereferrences what ever the resource handle points to, this is used to 
     - rawptr: pointer to the actual data stored inside the store 
 */
 handle_resolve :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (^T, Resource_Error) {
+	lock := get_lock_seg(rs, handle)
+	sync.rw_mutex_shared_lock(lock)
+	defer sync.rw_mutex_shared_unlock(lock)
 	slot, ok := hm.get(&rs.handle_map, handle)
 	if !ok {
 		return nil, .Handle_Error
@@ -418,13 +442,17 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 	#partial switch error {
 	case .Not_Loaded:
 		//check
+		sync.rw_mutex_shared_lock(&rs.artficats_lock)
 		artifact, contains := rs.id_to_artifact[id]
+		sync.rw_mutex_shared_unlock(&rs.artficats_lock)
 		if !contains {
 			return Rs_Handle(T){}, .Missing_Artifact
 		}
 
 		//retrieve serializer
+		sync.rw_mutex_shared_lock(&rs.marshaller_lock)
 		serializer, ok := rs.marshallers[artifact._extension]
+		sync.rw_mutex_shared_unlock(&rs.marshaller_lock)
 		if !ok {
 			return {}, .Missing_Serializer
 		}
@@ -437,12 +465,13 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 			return {}, .Type_Missmatch
 		}
 
+		sync.rw_mutex_lock(&rs.categories_lock)
 		category, contained := &rs.categories[artifact.category_id]
 		assert(contained)
 		category.current_size_bytes += resource.data_size_bytes
 		over_budget := category.current_size_bytes > category.budget_bytes
 		fmt.assertf(!over_budget, "Budget of %v bytes for Category with id %v exceeded.", category.budget_bytes, category.category_id)
-
+		sync.rw_mutex_unlock(&rs.categories_lock)
 		return add_new_slot(rs, id, resource, T)
 	case:
 		return handle, error
@@ -490,40 +519,40 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 		return Resource_Future{.ERROR}
 	}
 
-	Bar :: struct {
-		file_path:  string,
-		marshaller: Resource_Marshaller,
-		rs:         ^Resource_Store,
-		slot:       ^Resource_Slot,
-		category:   Category_Id,
-		cb:         Resource_Callback,
-		dispatcher: Dispatcher,
+	Callback_Context :: struct {
+		file_path:         string,
+		marshaller:        Resource_Marshaller,
+		rs:                ^Resource_Store,
+		slot:              ^Resource_Slot,
+		category:          Category_Id,
+		resource_callback: Resource_Callback,
+		dispatcher:        Dispatcher,
 	}
 
-	bar := new(Bar)
-	bar^ = {artifact.baked_file_path, marshaller, rs, reserved_slot, artifact.category_id, callback, cb_dispatcher}
+	cb_context := new(Callback_Context)
+	cb_context^ = {artifact.baked_file_path, marshaller, rs, reserved_slot, artifact.category_id, callback, cb_dispatcher}
 
-	foo :: proc(task: thread.Task) {
-		casted := cast(^Bar)task.data
+	load :: proc(task: thread.Task) {
+		cb_context := cast(^Callback_Context)task.data
 
-		casted.slot.status = .IN_PROGRESS
+		cb_context.slot.status = .IN_PROGRESS
 		//TODO: update create_resource to have the ability to return an error
-		resource := casted.marshaller.create_resource(casted.marshaller.user_data, casted.file_path, casted.rs, casted.rs.sys_allocator)
+		resource := cb_context.marshaller.create_resource(cb_context.marshaller.user_data, cb_context.file_path, cb_context.rs, cb_context.rs.sys_allocator)
 		assert(resource.data != nil)
 
 		//TODO: update current_size_bytes
 
 		//insert resource into slot
-		casted.slot.resource = resource
-		casted.slot.status = .LOADED
+		cb_context.slot.resource = resource
+		cb_context.slot.status = .LOADED
 
 		//TODO: Dispatcher callback
 		// casted.dispatcher.post(casted.cb)
-		casted.cb.cb(casted.cb.user_data, Rs_Handle(any){casted.slot.handle})
-		free(casted)
+		cb_context.resource_callback.cb(cb_context.resource_callback.user_data, Rs_Handle(any){cb_context.slot.handle})
+		free(cb_context)
 	}
 
-	thread.pool_add_task(rs.pool, rs.sys_allocator, foo, bar)
+	thread.pool_add_task(rs.pool, rs.sys_allocator, load, cb_context)
 	thread.pool_start(rs.pool)
 	return {.IN_PROGRESS}
 }
@@ -581,12 +610,28 @@ add_new_slot :: proc(rs: ^Resource_Store, id: Rs_Id, resource: Resource, $T: typ
 		id        = id,
 		status    = status,
 	}
+
+	/*
+    we only have to lock the whole map when its map is about to grow.
+    for adds that dont grow the list we can be more clever
+    */
+	for &lock in rs.hm_lock_fragments {
+		sync.rw_mutex_lock(&lock)
+	}
+
 	handle, alloc_err := hm.add(&rs.handle_map, slot)
 	assert(alloc_err == nil)
 
+
 	added_slot, _ := hm.get(&rs.handle_map, handle)
+	sync.rw_mutex_lock(&rs.loaded_lock)
 	rs.id_to_loaded[id] = handle
+	sync.rw_mutex_unlock(&rs.loaded_lock)
 	added_slot.handle = handle
+
+	for &lock in rs.hm_lock_fragments {
+		sync.rw_mutex_unlock(&lock)
+	}
 	return Rs_Handle(T){handle}, .None
 }
 
@@ -602,14 +647,31 @@ init_categories :: proc(rs: ^Resource_Store, config: Category_Configuration) {
 	cache_init(&rs.categories[config.category_id], config.cache_budget_bytes)
 }
 
+@(private)
+get_lock_seg :: proc(rs: ^Resource_Store, handle: hm.Handle64) -> ^sync.RW_Mutex {
+	return &rs.hm_lock_fragments[handle.idx % HM_SEGMENTS]
+}
+
 /*
 
 //TODO better handling here.
 */
 resource_remove :: proc(rs: ^Resource_Store, removed_slot: ^Resource_Slot) -> Resource_Error {
+	for &lock in rs.hm_lock_fragments {
+		sync.rw_mutex_lock(&lock)
+	}
+
 	removed_slot.destructor(removed_slot.data, rs)
 	found, _ := hm.remove(&rs.handle_map, removed_slot.handle)
+
+	sync.rw_mutex_lock(&rs.loaded_lock)
 	delete_key(&rs.id_to_loaded, removed_slot.id)
+	sync.rw_mutex_unlock(&rs.loaded_lock)
+
+	for &lock in rs.hm_lock_fragments {
+		sync.rw_mutex_unlock(&lock)
+	}
+
 	if !found {
 		return .Handle_Error
 	}
@@ -620,7 +682,9 @@ resource_remove :: proc(rs: ^Resource_Store, removed_slot: ^Resource_Slot) -> Re
 
 */
 id_from_handle :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Id, Resource_Error) {
+	sync.rw_mutex_shared_lock(get_lock_seg(rs, handle))
 	slot, contained := hm.get(&rs.handle_map, handle)
+	sync.rw_mutex_shared_unlock(get_lock_seg(rs, handle))
 	if !contained {
 		return {}, .Handle_Error
 	}
@@ -679,7 +743,6 @@ Requirements:
 - dynamic/adjustable max size
 
 */
-
 Resource_Category :: struct {
 	budget_bytes:       u64,
 	current_size_bytes: u64,
@@ -689,6 +752,7 @@ Resource_Category :: struct {
 
 
 CacheLRU :: struct {
+	lock:                     sync.Mutex,
 	cache_current_size_bytes: u64,
 	cache_max_size_bytes:     u64,
 	linked_list:              list.List,
@@ -700,14 +764,18 @@ cache_init :: proc(cache: ^CacheLRU, max_size_bytes: u64) {
 }
 
 cache_add_entry :: proc(rs: ^Resource_Store, cache: ^CacheLRU, slot: ^Resource_Slot) {
+	sync.lock(&cache.lock)
 	cache.cache_current_size_bytes += slot.data_size_bytes
 	list.push_front(&cache.linked_list, &slot.node)
+	sync.unlock(&cache.lock)
 	cache_ensure_limit(rs, cache)
 }
 
 cache_take_entry :: proc(rs: ^Resource_Store, cache: ^CacheLRU, slot: ^Resource_Slot) {
+	sync.lock(&cache.lock)
 	cache.cache_current_size_bytes -= slot.data_size_bytes
 	list.remove(&cache.linked_list, &slot.node)
+	sync.unlock(&cache.lock)
 }
 
 cache_ensure_limit :: proc {
@@ -716,6 +784,7 @@ cache_ensure_limit :: proc {
 }
 
 cache_ensure_limit_to_size :: proc(rs: ^Resource_Store, cache: ^CacheLRU, target_size: u64) {
+	sync.lock(&cache.lock)
 	for cache.cache_current_size_bytes > target_size {
 		removed_node := list.pop_back(&cache.linked_list)
 		assert(removed_node != nil)
@@ -724,6 +793,7 @@ cache_ensure_limit_to_size :: proc(rs: ^Resource_Store, cache: ^CacheLRU, target
 		assert(err == .None)
 		cache.cache_current_size_bytes -= removed_slot.data_size_bytes
 	}
+	sync.unlock(&cache.lock)
 }
 
 cache_ensure_limit_max_size :: proc(rs: ^Resource_Store, cache: ^CacheLRU) {

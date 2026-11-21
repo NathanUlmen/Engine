@@ -5,8 +5,6 @@ import "core:time"
 import sdl "vendor:sdl3"
 
 /*
-Application is a global container
-
 */
 Application :: struct {
 	#subtype input: Input_State,

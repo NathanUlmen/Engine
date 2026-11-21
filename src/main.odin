@@ -63,10 +63,6 @@ update :: proc(app: ^Application, deltaT: f32, foo: ^Game_Context) -> (ok: bool)
 	if is_just_pressed(app, .S) do log.info("S is pressed")
 	if is_just_pressed(app, .D) do log.info("D is pressed")
 
-	if is_pressed(app, .MOUSE_LEFT) do log.info("M1 is held")
-
-	if is_just_pressed(app, .R) do log.info("Fps", app.graphics.fps)
-
 
 	return true
 }
