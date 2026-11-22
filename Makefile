@@ -16,6 +16,9 @@ build-release:
 clean:
 	rm prog; rm release
 
+clean-all:
+	rm -rf out/*
+
 test:
 	odin test tests/unit/ -out:out/unit -debug -define:ODIN_TEST_THREADS=$(TEST_THREAD_COUNT)
 
