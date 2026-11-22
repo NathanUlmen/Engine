@@ -2,6 +2,7 @@ package main
 
 import "core:log"
 import "core:time"
+import gl "vendor:OpenGL"
 import sdl "vendor:sdl3"
 
 /*
@@ -12,20 +13,35 @@ Application :: struct {
 }
 
 Graphics :: struct {
-	fps:    f32,
-	deltaT: f32, //in seconds
-	window: ^sdl.Window,
+	fps:        f32,
+	deltaT:     f32, //in seconds
+	window:     ^sdl.Window,
+	gl_context: sdl.GLContext,
+}
+
+Game :: struct($T: typeid) {
+	game_context: T,
+	game_create:  proc(game_context: T) -> bool,
+	game_destroy: proc(game_context: T),
+	update:       proc(app: ^Application, deltaT: f32, game_context: ^T) -> (ok: bool),
+	game_exit:    proc(game_context: T),
 }
 
 application_init :: proc(app: ^Application) {
 	if !sdl.Init({.VIDEO}) {
 		log.error("Failed to init video using sdl. ", sdl.GetError())
 	}
-	flags := sdl.WindowFlags{}
+
+	flags := sdl.WindowFlags{.OPENGL}
 	app.graphics.window = sdl.CreateWindow("PLACE HOLDER", 960, 960, flags)
 	if app.graphics.window == nil {
 		log.error("Failed to create Window", sdl.GetError())
 	}
+
+	app.graphics.gl_context = sdl.GL_CreateContext(app.graphics.window)
+
+	gl.load_up_to(4, 3, sdl.gl_set_proc_address)
+
 }
 
 application_destroy :: proc() {}
@@ -40,7 +56,6 @@ loop :: proc(app: ^Application, game: ^Game($T)) {
 		duration := time.tick_diff(current, now)
 		current = now
 		app.graphics.deltaT = f32(time.duration_seconds(duration))
-
 
 		//update fps - this approach is gremlin but is good enough for now
 		fps_accumulator += app.graphics.deltaT
@@ -90,21 +105,13 @@ loop :: proc(app: ^Application, game: ^Game($T)) {
 			}
 		}
 
-		//user code update
-		surface := sdl.GetWindowSurface(app.graphics.window)
-		blue := sdl.MapSurfaceRGB(surface, 40, 90, 160)
-		sdl.FillSurfaceRect(surface, nil, blue)
-		if !sdl.UpdateWindowSurface(app.graphics.window) {
-			log.error("Failed to update!")
-			panic("")
-		}
-
-		//exit if error
+		//user code update, exit if error
 		if !game.update(app, app.graphics.deltaT, &game.game_context) do return
+
+		sdl.GL_SwapWindow(app.graphics.window)
 
 	}
 }
-
 
 Input_Status :: enum {
 	NONE,
@@ -132,14 +139,6 @@ is_pressed :: proc(input: Input_State, key: Input_Code) -> bool {
 
 is_just_pressed :: proc(input: Input_State, key: Input_Code) -> bool {
 	return input.keys[key] == .JUST_PRESSED
-}
-
-Game :: struct($T: typeid) {
-	game_context: T,
-	game_create:  proc(),
-	game_destroy: proc(),
-	update:       proc(app: ^Application, deltaT: f32, game_context: ^T) -> (ok: bool),
-	game_exit:    proc(),
 }
 
 

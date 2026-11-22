@@ -45,24 +45,9 @@ main :: proc() {
 	app: Application
 	game := new(Game(Game_Context))
 	game^ = {{}, nil, nil, update, nil}
-	defer game.game_destroy()
 	application_init(&app)
 
 	//run user code
 	loop(&app, game)
 
-}
-
-Game_Context :: struct {
-	rs: Resource_Store,
-}
-
-update :: proc(app: ^Application, deltaT: f32, foo: ^Game_Context) -> (ok: bool) {
-	if is_just_pressed(app, .W) do log.info("W is pressed")
-	if is_just_pressed(app, .A) do log.info("A is pressed")
-	if is_just_pressed(app, .S) do log.info("S is pressed")
-	if is_just_pressed(app, .D) do log.info("D is pressed")
-
-
-	return true
 }

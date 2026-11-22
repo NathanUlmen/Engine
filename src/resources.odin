@@ -320,9 +320,10 @@ handle_acquire :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle
 
 	sync.rw_mutex_lock(get_lock_seg(rs, handle))
 	target_slot, contained := hm.get(&rs.handle_map, handle)
-	defer sync.rw_mutex_unlock(get_lock_seg(rs, handle))
+
 	if contained && target_slot.status == .LOADED {
 		if target_slot.type != T {
+			sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 			return {}, .Type_Missmatch
 		}
 
@@ -337,12 +338,19 @@ handle_acquire :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle
 			category.current_size_bytes += target_slot.data_size_bytes
 			sync.rw_mutex_unlock(&rs.categories_lock)
 
+			sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 			cache_take_entry(rs, category, target_slot)
+		} else {
+			sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 		}
+
+		sync.rw_mutex_lock(get_lock_seg(rs, handle))
 		target_slot.ref_count += 1
+		sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 		//should we check for overflow here?
 		return Rs_Handle(T){handle = target_slot.handle}, .None
 	}
+	sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 	return {}, .Not_Loaded
 }
 
@@ -374,31 +382,44 @@ handle_duplicate :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Hand
     - err:
 */
 handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_Error {
+	sync.rw_mutex_lock(get_lock_seg(rs, handle))
 	slot, ok := hm.get(&rs.handle_map, handle)
+
+
 	if !ok {
+		sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 		return .Handle_Error
 	}
 
 	slot.ref_count -= 1
 	assert(slot.ref_count != bits.U32_MAX, "Invalid Frees have occurred!")
 
+
 	//give ownership to the cache
 	if slot.ref_count == 0 {
+		sync.rw_mutex_unlock(get_lock_seg(rs, handle))
+
+		sync.rw_mutex_shared_lock(&rs.artficats_lock)
 		artifact, contained := rs.id_to_artifact[slot.id]
+		sync.rw_mutex_shared_unlock(&rs.artficats_lock)
 		//this means a resource was registered and thus should not be cached.
 		if !contained {
 			return resource_remove(rs, slot)
 		}
 
+		sync.rw_mutex_lock(&rs.categories_lock)
 		category, category_contained := &rs.categories[artifact.category_id]
 		if !category_contained {
 			//TODO: might want to revist this later as error from resource_remove is not handled...
 			resource_remove(rs, slot)
+			sync.rw_mutex_unlock(&rs.categories_lock)
 			return .Missing_Category
 		}
 		category.current_size_bytes -= slot.resource.data_size_bytes
+		sync.rw_mutex_unlock(&rs.categories_lock)
 		cache_add_entry(rs, &category.cache, slot)
 	}
+	sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 	return .None
 }
 
@@ -490,13 +511,21 @@ the callback is sent to the dispatcher immediately. The user must
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
 resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_Callback, cb_dispatcher: Dispatcher, $T: typeid) -> Resource_Future {
+	sync.rw_mutex_shared_lock(&rs.loaded_lock)
 	handle := rs.id_to_loaded[id]
+	sync.rw_mutex_shared_unlock(&rs.loaded_lock)
+
+	sync.rw_mutex_lock(get_lock_seg(rs, handle))
 	slot, contained := hm.get(&rs.handle_map, handle)
+
+
 	if contained {
 		slot.ref_count += 1
+		sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 		//TODO: post callback to dispatcher
 		return Resource_Future{.LOADED}
 	}
+	sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 
 	//Case: Resrouce not loaded.
 	//1. Reserve/check out a slot for our data.
@@ -505,16 +534,23 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 	//TODO: handlde error better.
 	assert(err == .None)
 
+	sync.rw_mutex_shared_lock(get_lock_seg(rs, handle))
 	reserved_slot := hm.get(&rs.handle_map, new_slot_handle)
+	sync.rw_mutex_shared_unlock(get_lock_seg(rs, handle))
 
 
 	//2. Start loading of our resrouce
+	sync.rw_mutex_shared_lock(&rs.artficats_lock)
 	artifact, cont := rs.id_to_artifact[id]
+	sync.rw_mutex_shared_unlock(&rs.artficats_lock)
+
 	if !cont {
 		return {.ERROR}
 	}
 
+	sync.rw_mutex_shared_lock(&rs.marshaller_lock)
 	marshaller, has := rs.marshallers[artifact._extension]
+	sync.rw_mutex_shared_unlock(&rs.marshaller_lock)
 	if !has {
 		return Resource_Future{.ERROR}
 	}
@@ -535,7 +571,10 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 	load :: proc(task: thread.Task) {
 		cb_context := cast(^Callback_Context)task.data
 
+		sync.rw_mutex_lock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 		cb_context.slot.status = .IN_PROGRESS
+		sync.rw_mutex_unlock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
+
 		//TODO: update create_resource to have the ability to return an error
 		resource := cb_context.marshaller.create_resource(cb_context.marshaller.user_data, cb_context.file_path, cb_context.rs, cb_context.rs.sys_allocator)
 		assert(resource.data != nil)
@@ -543,8 +582,10 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 		//TODO: update current_size_bytes
 
 		//insert resource into slot
+		sync.rw_mutex_lock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 		cb_context.slot.resource = resource
 		cb_context.slot.status = .LOADED
+		sync.rw_mutex_unlock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 
 		//TODO: Dispatcher callback
 		// casted.dispatcher.post(casted.cb)
@@ -624,10 +665,12 @@ add_new_slot :: proc(rs: ^Resource_Store, id: Rs_Id, resource: Resource, $T: typ
 
 
 	added_slot, _ := hm.get(&rs.handle_map, handle)
+	added_slot.handle = handle
+
 	sync.rw_mutex_lock(&rs.loaded_lock)
 	rs.id_to_loaded[id] = handle
 	sync.rw_mutex_unlock(&rs.loaded_lock)
-	added_slot.handle = handle
+
 
 	for &lock in rs.hm_lock_fragments {
 		sync.rw_mutex_unlock(&lock)
@@ -661,7 +704,9 @@ resource_remove :: proc(rs: ^Resource_Store, removed_slot: ^Resource_Slot) -> Re
 		sync.rw_mutex_lock(&lock)
 	}
 
-	removed_slot.destructor(removed_slot.data, rs)
+	destructor := removed_slot.destructor
+	data := removed_slot.data
+
 	found, _ := hm.remove(&rs.handle_map, removed_slot.handle)
 
 	sync.rw_mutex_lock(&rs.loaded_lock)
@@ -671,6 +716,8 @@ resource_remove :: proc(rs: ^Resource_Store, removed_slot: ^Resource_Slot) -> Re
 	for &lock in rs.hm_lock_fragments {
 		sync.rw_mutex_unlock(&lock)
 	}
+
+	destructor(data, rs)
 
 	if !found {
 		return .Handle_Error
