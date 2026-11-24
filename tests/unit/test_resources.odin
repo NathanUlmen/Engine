@@ -79,7 +79,7 @@ test_acquire_handle_non_loaded :: proc(t: ^testing.T) {
 		testing.expect(t, found)
 
 		//release handle, should go into the cache now
-		src.handle_release(rs, handle)
+		src.handle_release(rs, &handle)
 
 		//assert the resource is in the cache
 		status := src.resource_load_status(rs, id)
@@ -96,18 +96,18 @@ test_invalid_free :: proc(t: ^testing.T) {
 		cleanup_rs_store(rs)
 	}
 
-	testing.cleanup(t, cleanup_rs_store, rs)
 	for id, _ in rs.id_to_artifact {
-		err := src.handle_release(rs, src.Rs_Handle(string){})
+		err := src.handle_release(rs, &src.Rs_Handle(string){})
 		testing.expect(t, err == .Handle_Error)
 
 		handle, _ := src.resource_load(rs, id, string)
 
-		err = src.handle_release(rs, handle)
+		err = src.handle_release(rs, &handle)
 		testing.expect(t, err == .None)
 
-		testing.expect_assert(t, "Invalid Frees have occurred!")
-		src.handle_release(rs, handle)
+		// testing.expect_assert(t, "Invalid Frees have occurred!")
+		err = src.handle_release(rs, &handle)
+		testing.expect(t, err == .Handle_Error)
 	}
 
 }
@@ -132,8 +132,8 @@ test_acquire_loaded_resource :: proc(t: ^testing.T) {
 		other, _ := src.handle_acquire(rs, id, string)
 		testing.expect(t, ref_count(rs, id) == 2)
 
-		src.handle_release(rs, loaded)
-		src.handle_release(rs, other)
+		src.handle_release(rs, &loaded)
+		src.handle_release(rs, &other)
 
 		testing.expect(t, ref_count(rs, id) == 0)
 	}
@@ -208,7 +208,7 @@ test_cache_resize :: proc(t: ^testing.T) {
 		rs_handle, err := src.resource_load(rs, id, string)
 		testing.expect(t, err == .None)
 
-		err = src.handle_release(rs, rs_handle)
+		err = src.handle_release(rs, &rs_handle)
 		testing.expect(t, err == .None)
 	}
 
@@ -314,14 +314,14 @@ test_resource_register :: proc(t: ^testing.T) {
 	duplicated, duplication_error := src.handle_duplicate(rs, registered_handle)
 	testing.expect(t, duplication_error == .None)
 
-	testing.expect(t, src.handle_release(rs, duplicated) == .None)
+	testing.expect(t, src.handle_release(rs, &duplicated) == .None)
 
 
 	for id, _ in rs.id_to_loaded {
 		testing.expect(t, ref_count(rs, id) == 1)
 	}
 
-	testing.expect(t, src.handle_release(rs, registered_handle) == .None)
+	testing.expect(t, src.handle_release(rs, &registered_handle) == .None)
 
 	testing.expect(t, len(rs.id_to_loaded) == 0)
 }
@@ -361,8 +361,8 @@ test_cache_clean :: proc(t: ^testing.T) {
 	}
 
 
-	for handle in handles {
-		src.handle_release(rs, handle)
+	for &handle in handles {
+		src.handle_release(rs, &handle)
 	}
 	loaded := len(rs.id_to_loaded)
 	testing.expect(t, loaded == len(rs.id_to_artifact))
@@ -415,8 +415,8 @@ test_category_byte_counts_accurate :: proc(t: ^testing.T) {
 	}
 	starting_size := rs.categories[DEFAULT_CATEGORY].current_size_bytes
 	i = 1
-	for handle in handles {
-		src.handle_release(rs, handle)
+	for &handle in handles {
+		src.handle_release(rs, &handle)
 		testing.expect(t, rs.categories[DEFAULT_CATEGORY].current_size_bytes == starting_size - i)
 		testing.expect(t, rs.categories[DEFAULT_CATEGORY].cache_current_size_bytes == i)
 		i += 1

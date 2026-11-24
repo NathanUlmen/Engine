@@ -19,7 +19,8 @@ import "core:path/filepath"
 
 Category_Id :: u32
 
-HM_SEGMENTS :: 512
+//Increase this if large amounts of loaded items are being delt with at a time.
+HM_SEGMENTS :: 32
 
 /*
 Used to configure a resource category.
@@ -374,22 +375,25 @@ handle_duplicate :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> (Rs_Hand
 }
 
 /*
-"Releases" the handle to the associated Resource, decreasing the ref_count by one.
+Releases he handle to the associated Resource, decreasing the ref_count by one. Also destroys the handle, making it no longer reference the element.
     Inputs:
-    - rs:
-    - handle:
+    - rs: The Resource_Store that the handle was produced by.
+    - handle: the handle that will be freed
     Returns:
-    - err:
+    - err: 
 */
-handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_Error {
-	sync.rw_mutex_lock(get_lock_seg(rs, handle))
-	slot, ok := hm.get(&rs.handle_map, handle)
-
+handle_release :: proc(rs: ^Resource_Store, handle: ^Rs_Handle($T)) -> Resource_Error {
+	copy_handle: Rs_Handle(T) = handle^
+	sync.rw_mutex_lock(get_lock_seg(rs, copy_handle))
+	slot, ok := hm.get(&rs.handle_map, copy_handle)
 
 	if !ok {
-		sync.rw_mutex_unlock(get_lock_seg(rs, handle))
+		sync.rw_mutex_unlock(get_lock_seg(rs, copy_handle))
 		return .Handle_Error
 	}
+
+	//destroy handle
+	handle.handle = {}
 
 	slot.ref_count -= 1
 	assert(slot.ref_count != bits.U32_MAX, "Invalid Frees have occurred!")
@@ -397,7 +401,7 @@ handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_E
 
 	//give ownership to the cache
 	if slot.ref_count == 0 {
-		sync.rw_mutex_unlock(get_lock_seg(rs, handle))
+		sync.rw_mutex_unlock(get_lock_seg(rs, copy_handle))
 
 		sync.rw_mutex_shared_lock(&rs.artficats_lock)
 		artifact, contained := rs.id_to_artifact[slot.id]
@@ -419,7 +423,7 @@ handle_release :: proc(rs: ^Resource_Store, handle: Rs_Handle($T)) -> Resource_E
 		sync.rw_mutex_unlock(&rs.categories_lock)
 		cache_add_entry(rs, &category.cache, slot)
 	}
-	sync.rw_mutex_unlock(get_lock_seg(rs, handle))
+	sync.rw_mutex_unlock(get_lock_seg(rs, copy_handle))
 	return .None
 }
 
