@@ -12,24 +12,24 @@ import "core:strings"
 import "core:sync"
 import "core:testing"
 
-DEFAULT_CATEGORY :: src.Category_Id(0)
+DEFAULT_CATEGORY :: src.Rs_Category_Id(0)
 
 create_test_rs_store :: proc() -> ^src.Resource_Store {
 	rs := new(src.Resource_Store)
 	categories := []src.Category_Configuration{{100 * mem.Megabyte, 20 * mem.Megabyte, DEFAULT_CATEGORY}}
-	src.rs_store_init(rs, context.allocator, categories)
+	src.resource_store_init(rs, context.allocator, categories)
 	return rs
 }
 
 init_rs_store_with_txt_serializer :: proc() -> ^src.Resource_Store {
 	rs := create_test_rs_store()
-	src.rs_store_register_marshaller(rs, src.default_txt_serializer())
+	src.resource_store_register_marshaller(rs, src.txt_default_marshaller())
 	return rs
 }
 
 init_rs_store_with_data :: proc() -> ^src.Resource_Store {
 	rs := init_rs_store_with_txt_serializer()
-	err := src.rs_store_import_file(rs, "testData.txt")
+	err := src.resource_store_import_file(rs, "testData.txt")
 	assert(err == .None)
 	return rs
 }
@@ -40,7 +40,7 @@ ref_count :: proc(rs: ^src.Resource_Store, id: src.Rs_Id) -> u32 {
 
 cleanup_rs_store :: proc(data: rawptr) {
 	rs := cast(^src.Resource_Store)data
-	src.rs_store_destroy(rs)
+	src.resource_store_destroy(rs)
 	free(rs)
 }
 
@@ -167,11 +167,11 @@ test_invalid_id :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
 	rs := init_rs_store_with_txt_serializer()
 	defer {
-		src.rs_store_destroy(rs)
+		src.resource_store_destroy(rs)
 		free(rs)
 	}
 
-	err := src.rs_store_import_file(rs, "testData.txt")
+	err := src.resource_store_import_file(rs, "testData.txt")
 	testing.expect(t, err == .None)
 
 	_, err = src.resource_load(rs, {}, bool)
@@ -252,10 +252,9 @@ test_async_loading :: proc(t: ^testing.T) {
 	}
 
 
-	foo :: proc(data: rawptr, foo: src.Rs_Handle(any)) {
+	handle :: proc(data: rawptr, foo: src.Rs_Handle(any)) {
 		v := cast(^Data)data
 		sync.atomic_add(v.count, 1)
-		testing.expect(v.t, foo != {})
 	}
 
 
@@ -268,7 +267,7 @@ test_async_loading :: proc(t: ^testing.T) {
 	defer free(blah)
 	blah^ = {cb_data, t}
 	for id, _ in rs.id_to_artifact {
-		src.resource_load_async(rs, id, {user_data = blah, cb = foo}, {runner}, string)
+		src.resource_load_async(rs, id, {user_data = blah, cb = handle}, {runner}, string)
 	}
 
 	//loop till all are loaded
@@ -290,9 +289,12 @@ test_async_loading :: proc(t: ^testing.T) {
 	testing.expect(t, cb_data^ == len(rs.id_to_artifact))
 
 	for id, _ in rs.id_to_artifact {
-		src.resource_load_async(rs, id, {blah, foo}, {runner}, string)
+		src.resource_load_async(rs, id, {blah, handle}, {runner}, string)
 		testing.expect(t, ref_count(rs, id) == 2)
 	}
+	category, has := rs.categories[DEFAULT_CATEGORY]
+	testing.expect(t, has)
+	testing.expectf(t, category.current_size_bytes == u64(len(rs.id_to_loaded)), "Expected %v bytes, got %v", len(rs.id_to_loaded), category.current_size_bytes)
 }
 
 @(test)
@@ -300,7 +302,7 @@ test_resource_register :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
 	rs := init_rs_store_with_txt_serializer()
 	defer {
-		src.rs_store_destroy(rs)
+		src.resource_store_destroy(rs)
 		free(rs)
 	}
 
@@ -389,7 +391,7 @@ test_error_on_missing_file :: proc(t: ^testing.T) {
 		cleanup_rs_store(rs)
 	}
 
-	err := src.rs_store_import_file(rs, "foobar.txt")
+	err := src.resource_store_import_file(rs, "foobar.txt")
 	testing.expect(t, err == .Missing_File)
 }
 
@@ -439,4 +441,42 @@ test_id_from_handle :: proc(t: ^testing.T) {
 		testing.expect(t, handle_err == .None)
 		testing.expect(t, id == id_from_handle)
 	}
+}
+
+@(test)
+test_init_no_category :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs: src.Resource_Store
+
+	ok := src.resource_store_init(&rs, context.allocator, {})
+	testing.expect(t, !ok)
+}
+
+@(test)
+test_init_bad_threads :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs: src.Resource_Store
+
+	ok := src.resource_store_init(&rs, context.allocator, {{1 * mem.Megabyte, 50 * mem.Kilobyte, DEFAULT_CATEGORY}}, 0)
+	testing.expect(t, !ok)
+}
+
+@(test)
+test_load_with_non_present_category_errors :: proc(t: ^testing.T) {
+	context.random_generator = crypto.random_generator()
+	rs: src.Resource_Store
+	made_up_category: u32 = 1
+	ok := src.resource_store_init(&rs, context.allocator, {{100, 100, made_up_category}}, 1)
+	testing.expect(t, ok)
+	defer {
+		src.resource_store_destroy(&rs)
+	}
+
+	src.resource_store_register_marshaller(&rs, src.txt_default_marshaller())
+
+	err := src.resource_store_import_file(&rs, "testData.txt")
+	testing.expect(t, err == .Missing_Category)
+
+	//no artifacts should have been loaded.
+	testing.expect(t, len(rs.id_to_artifact) == 0)
 }

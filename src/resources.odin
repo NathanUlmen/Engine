@@ -17,7 +17,7 @@ import "core:mem"
 import "core:path/filepath"
 
 
-Category_Id :: u32
+Rs_Category_Id :: u32
 
 //Increase this if large amounts of loaded items are being delt with at a time.
 HM_SEGMENTS :: 32
@@ -32,7 +32,7 @@ Used to configure a resource category.
 Category_Configuration :: struct {
 	category_budget_bytes: u64,
 	cache_budget_bytes:    u64,
-	category_id:           Category_Id,
+	category_id:           Rs_Category_Id,
 }
 
 
@@ -40,7 +40,7 @@ Resource_Store :: struct {
 	marshallers:       map[string]Resource_Marshaller,
 	id_to_artifact:    map[Rs_Id]Resource_Artifact,
 	id_to_loaded:      map[Rs_Id]hm.Handle64,
-	categories:        map[Category_Id]Resource_Category,
+	categories:        map[Rs_Category_Id]Resource_Category,
 	sys_allocator:     mem.Allocator,
 	handle_map:        hm.Dynamic_Handle_Map(Resource_Slot, hm.Handle64),
 	pool:              ^thread.Pool,
@@ -66,6 +66,8 @@ Resource_Error :: enum u8 {
 	Category_Missmatch,
 	Category_Bugdet_Exceeded,
 	Missing_Category,
+	Import_Error,
+	Creation_Error,
 }
 
 Rs_Id :: uuid.Identifier
@@ -111,8 +113,13 @@ Load_Status :: enum {
 	ERROR,
 }
 
+Batch_Request :: struct {
+	type: typeid,
+	id:   Rs_Id,
+}
+
 /*
-A future to a resource that is being acquired asynchronously.
+A future to a resource that is being 
 
 */
 Resource_Future :: struct {
@@ -130,7 +137,7 @@ Resource_Callback :: struct {
 
 Marshaller_Context :: struct {
 	user_data:                  rawptr,
-	destroy_serializer_context: proc(user_data: rawptr, allocator: mem.Allocator),
+	destroy_marshaller_context: proc(user_data: rawptr, allocator: mem.Allocator),
 }
 
 /*
@@ -138,15 +145,15 @@ An "interface" used by the ResourceStore.
     Fields:
     - user_data: custom user data field 
     - extension: file extension that this serializer is capable of handling. Must include the '.' EX: ".txt"
-    - import_resource: 
-    - hydrate_resource: procedure that is responsible for transforming the file bytes of the artifact into useful data.
+    - import_resource: procedure that reads in a file and then writes the transformed elements to disk. Must return resources artifacts
+    - create_resource: procedure that is responsible for transforming the file bytes of the artifact into useful data.
     - destroy_resource: destroy a resource created by this serializer.
 */
 Resource_Marshaller :: struct {
 	using serializer_context: Marshaller_Context,
 	extension:                string,
 	import_resource:          proc(user_data: rawptr, file_path: string, store_allocator: mem.Allocator) -> (a: []Resource_Artifact, ok: bool),
-	create_resource:          proc(user_data: rawptr, file_path: string, rs: ^Resource_Store, store_allocator: mem.Allocator) -> Resource,
+	create_resource:          proc(user_data: rawptr, file_path: string, rs: ^Resource_Store, store_allocator: mem.Allocator) -> (resource: Resource, ok: bool),
 }
 
 /*
@@ -163,12 +170,12 @@ Resource_Marshaller :: struct {
 */
 Resource_Artifact :: struct {
 	stable_id:            Rs_Id, //maybe we can handle this for the user?
-	dependencies:         []Rs_Id,
+	dependencies:         []Rs_Id, //TODO: load these for the user?
 	baked_file_path:      string,
 	name:                 string,
 	progenitor_file_path: string, //we can handle
 	_extension:           string, //we can handle
-	category_id:          Category_Id,
+	category_id:          Rs_Category_Id,
 	import_version:       u16,
 }
 
@@ -180,25 +187,27 @@ Inputs:
     - allocator: The allocator that the Resource_Store will use for all allocations.
     - thread_count: The number of threads available to use for asynchronous loading.
 */
-rs_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator, categories: []Category_Configuration = nil, thread_count: int = 1) {
+resource_store_init :: proc(rs: ^Resource_Store, allocator: mem.Allocator, categories: []Category_Configuration = nil, thread_count: int = 1) -> (ok: bool) {
+	//TODO: should you be able to create a store without any categories?
+	if categories == nil || thread_count < 1 {
+		return false
+	}
 	//TODO: figure out how to assert random generation is enabled/init.
 	rs.sys_allocator = allocator
 	rs.marshallers = make(map[string]Resource_Marshaller, rs.sys_allocator)
 	rs.id_to_artifact = make(map[Rs_Id]Resource_Artifact, rs.sys_allocator)
 	rs.id_to_loaded = make(map[Rs_Id]hm.Handle64, rs.sys_allocator)
-	rs.categories = make(map[Category_Id]Resource_Category, rs.sys_allocator)
+	rs.categories = make(map[Rs_Category_Id]Resource_Category, rs.sys_allocator)
 
-
-	if categories != nil {
-		for config in categories {
-			init_categories(rs, config)
-		}
+	assert(categories != nil)
+	for config in categories {
+		init_categories(rs, config)
 	}
 
 	hm.dynamic_init(&rs.handle_map, rs.sys_allocator)
 	rs.pool = new(thread.Pool)
 	thread.pool_init(rs.pool, rs.sys_allocator, thread_count)
-	//TODO: default cache creation and init
+	return true
 }
 
 /*
@@ -206,7 +215,7 @@ Frees all resources stored stored inside the Resource_Store. Shutsdown thread po
 Inputs:
     - rs: The system that will be freed. 
 */
-rs_store_destroy :: proc(rs: ^Resource_Store) {
+resource_store_destroy :: proc(rs: ^Resource_Store) {
 	thread.pool_join(rs.pool)
 	thread.pool_destroy(rs.pool)
 	free(rs.pool)
@@ -218,8 +227,11 @@ rs_store_destroy :: proc(rs: ^Resource_Store) {
 
 	hm.dynamic_destroy(&rs.handle_map)
 
-	for _, serializer in rs.marshallers {
-		serializer.destroy_serializer_context(serializer.user_data, rs.sys_allocator)
+	for _, marshaller in rs.marshallers {
+		//TODO: should warn if user data is not nil and destructor is nil
+		if marshaller.user_data != nil && marshaller.destroy_marshaller_context != nil {
+			marshaller.destroy_marshaller_context(marshaller.user_data, rs.sys_allocator)
+		}
 	}
 
 	delete(rs.id_to_loaded)
@@ -249,7 +261,7 @@ Marshallers are invoked/used based on file extension.
     - rs:
     - serializer:
 */
-rs_store_register_marshaller :: proc(rs: ^Resource_Store, serializer: Resource_Marshaller) {
+resource_store_register_marshaller :: proc(rs: ^Resource_Store, serializer: Resource_Marshaller) {
 	when ODIN_DEBUG {
 		if _, contains := rs.marshallers[serializer.extension]; contains {
 			log.warnf("Replaced existing serializer responsible for extension %v", serializer.extension)
@@ -258,7 +270,7 @@ rs_store_register_marshaller :: proc(rs: ^Resource_Store, serializer: Resource_M
 	assert(len(serializer.extension) > 0)
 	to_replace, contained := rs.marshallers[serializer.extension]
 	if contained {
-		to_replace.destroy_serializer_context(to_replace.user_data, rs.sys_allocator)
+		to_replace.destroy_marshaller_context(to_replace.user_data, rs.sys_allocator)
 	}
 	rs.marshallers[serializer.extension] = serializer
 }
@@ -274,7 +286,7 @@ manifest that the Resource_Store uses to handle loading and .. TODO.
     - err: A Missing_Serializer when a Marshaller is not present or a Serialization_Error when something goes wrong during the import
     process in the Marshallers import_resource procedure.
 */
-rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: Resource_Error) {
+resource_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: Resource_Error) {
 	//Retrieve serializer
 	extension := filepath.ext(target_file)
 	serializer, contains := rs.marshallers[extension]
@@ -289,6 +301,18 @@ rs_store_import_file :: proc(rs: ^Resource_Store, target_file: string) -> (err: 
 	artifacts, ok := serializer.import_resource(serializer.user_data, target_file, rs.sys_allocator)
 	if !ok {
 		return .Serialization_Error
+	}
+
+
+	//TODO: we can do this more efficiently
+	//make sure all artifacts belong to a category.
+	for artifact in artifacts {
+		if _, contained := rs.categories[artifact.category_id]; !contained {
+			for &a in artifacts {
+				artifact_destroy(rs, &a)
+			}
+			return .Missing_Category
+		}
 	}
 
 	//update the extension for the user.
@@ -482,7 +506,8 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 			return {}, .Missing_Serializer
 		}
 
-		resource := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
+		resource, create_ok := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
+		assert(create_ok)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
 
 		if T != resource.type {
@@ -505,9 +530,9 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 
 /*
 Acquires a handle to a resource in an asynchronous manner. If the requested resource is not 
-yet loaded it is loaded asynchronously. Once the resource is loaded into Memory the callback
-is sent to the dispatcher where it can then be fired. If the requested resource is already in memory 
-the callback is sent to the dispatcher immediately. The user must 
+yet loaded it is loaded asynchronously using a working thread from a thread pool. Once the resource is loaded successfully 
+the callback is posted to the dispatcher the caller provides. If the requested resource is already in memory 
+the callback is posted to the dispatcher immediately. 
     Inputs:
     - rs: the ResourceStore to 
     - id: The stable id to the resource you wish to read from memory.
@@ -542,7 +567,6 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 	reserved_slot := hm.get(&rs.handle_map, new_slot_handle)
 	sync.rw_mutex_shared_unlock(get_lock_seg(rs, handle))
 
-
 	//2. Start loading of our resrouce
 	sync.rw_mutex_shared_lock(&rs.artficats_lock)
 	artifact, cont := rs.id_to_artifact[id]
@@ -564,7 +588,7 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 		marshaller:        Resource_Marshaller,
 		rs:                ^Resource_Store,
 		slot:              ^Resource_Slot,
-		category:          Category_Id,
+		category:          Rs_Category_Id,
 		resource_callback: Resource_Callback,
 		dispatcher:        Dispatcher,
 	}
@@ -573,17 +597,25 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 	cb_context^ = {artifact.baked_file_path, marshaller, rs, reserved_slot, artifact.category_id, callback, cb_dispatcher}
 
 	load :: proc(task: thread.Task) {
+		context.logger = log.create_console_logger()
+		defer log.destroy_console_logger(context.logger)
 		cb_context := cast(^Callback_Context)task.data
 
 		sync.rw_mutex_lock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 		cb_context.slot.status = .IN_PROGRESS
 		sync.rw_mutex_unlock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 
-		//TODO: update create_resource to have the ability to return an error
-		resource := cb_context.marshaller.create_resource(cb_context.marshaller.user_data, cb_context.file_path, cb_context.rs, cb_context.rs.sys_allocator)
-		assert(resource.data != nil)
+		resource, ok := cb_context.marshaller.create_resource(cb_context.marshaller.user_data, cb_context.file_path, cb_context.rs, cb_context.rs.sys_allocator)
+		//TODO: better error handling for when create_resource fails.
+		assert(resource.data != nil && ok)
 
-		//TODO: update current_size_bytes
+		//increment our current size in bytes.
+		sync.rw_mutex_lock(&cb_context.rs.categories_lock)
+		category, has := &cb_context.rs.categories[cb_context.category]
+		assert(has)
+		category.current_size_bytes += resource.data_size_bytes
+		assert(category.current_size_bytes <= category.budget_bytes)
+		sync.rw_mutex_unlock(&cb_context.rs.categories_lock)
 
 		//insert resource into slot
 		sync.rw_mutex_lock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
@@ -592,8 +624,8 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 		sync.rw_mutex_unlock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 
 		//TODO: Dispatcher callback
-		// casted.dispatcher.post(casted.cb)
-		cb_context.resource_callback.cb(cb_context.resource_callback.user_data, Rs_Handle(any){cb_context.slot.handle})
+		cb_context.dispatcher.post(cb_context.resource_callback)
+		// cb_context.resource_callback.cb(cb_context.resource_callback.user_data, Rs_Handle(any){cb_context.slot.handle})
 		free(cb_context)
 	}
 
@@ -603,10 +635,19 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 }
 
 /*
+Loads a group of requested resources asynchronously in the same manner as resource_load_async.
+Doesnt complete until all requested resources have loaded successfully. 
 
 */
-batch_load_async :: proc(rs: ^Resource_Store) -> Resource_Future {
-	panic("handle_batch_acquire_async Unimplemented")
+batch_load_async :: proc(rs: ^Resource_Store, targets: []Batch_Request, callback: Resource_Callback, cb_dispatcher: Dispatcher) -> Resource_Future {
+	assert(targets != nil)
+	futures := make([]Resource_Future, len(targets))
+	// for request, idx in targets {
+	// 	futures[idx] = resource_load_async(rs, request.id, {}, {}, request.type)
+	// }
+	//join on futures. Once completed post the callback to the dispatcher
+
+	return {}
 }
 
 
@@ -638,9 +679,14 @@ resource_register :: proc(rs: ^Resource_Store, to_register: Resource, $T: typeid
 
 */
 resource_load_status :: proc(rs: ^Resource_Store, id: Rs_Id) -> Load_Status {
+	sync.rw_mutex_shared_lock(&rs.loaded_lock)
 	handle, contained := rs.id_to_loaded[id]
+	sync.rw_mutex_shared_unlock(&rs.loaded_lock)
 	if contained {
-		return hm.get(&rs.handle_map, handle).status
+		sync.rw_mutex_shared_lock(get_lock_seg(rs, handle))
+		status := hm.get(&rs.handle_map, handle).status
+		sync.rw_mutex_shared_unlock(get_lock_seg(rs, handle))
+		return status
 	} else {
 		return .NOT_LOADED
 	}
@@ -760,7 +806,7 @@ artifacts_read_from_disk :: proc(rs: ^Resource_Store, file_path: string) -> Reso
 /*
 
 */
-cache_clean :: proc(rs: ^Resource_Store, target_category: Category_Id) {
+cache_clean :: proc(rs: ^Resource_Store, target_category: Rs_Category_Id) {
 	category, contained := &rs.categories[target_category]
 	assert(contained)
 	cache_ensure_limit(rs, &category.cache, 0)
@@ -769,14 +815,14 @@ cache_clean :: proc(rs: ^Resource_Store, target_category: Category_Id) {
 /*
 
 */
-cache_resize :: proc(rs: ^Resource_Store, target_category: Category_Id, new_size_bytes: u64) {
+cache_resize :: proc(rs: ^Resource_Store, target_category: Rs_Category_Id, new_size_bytes: u64) {
 	category, contained := &rs.categories[target_category]
 	assert(contained)
 	category.cache_max_size_bytes = new_size_bytes
 	cache_ensure_limit(rs, &category.cache)
 }
 
-category_resize :: proc(rs: ^Resource_Store, target_category: Category_Id, new_size_bytes: u64) {
+category_resize :: proc(rs: ^Resource_Store, target_category: Rs_Category_Id, new_size_bytes: u64) {
 	category, contained := &rs.categories[target_category]
 	assert(contained)
 	category.budget_bytes = new_size_bytes
@@ -798,7 +844,7 @@ Resource_Category :: struct {
 	budget_bytes:       u64,
 	current_size_bytes: u64,
 	using cache:        CacheLRU,
-	category_id:        Category_Id,
+	category_id:        Rs_Category_Id,
 }
 
 
@@ -851,7 +897,7 @@ cache_ensure_limit_max_size :: proc(rs: ^Resource_Store, cache: ^CacheLRU) {
 	cache_ensure_limit_to_size(rs, cache, cache.cache_max_size_bytes)
 }
 
-cache_configure :: proc(rs: ^Resource_Store, cache_id: Category_Id, max_size_bytes: u64) {
+cache_configure :: proc(rs: ^Resource_Store, cache_id: Rs_Category_Id, max_size_bytes: u64) {
 	cache, _ := &rs.categories[cache_id]
 	cache.cache_max_size_bytes = max_size_bytes
 	cache_ensure_limit(rs, cache)
