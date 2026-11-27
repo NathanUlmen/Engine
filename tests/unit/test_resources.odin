@@ -491,3 +491,18 @@ test_load_with_non_present_category_errors :: proc(t: ^testing.T) {
 	//no artifacts should have been loaded.
 	testing.expect(t, len(rs.id_to_artifact) == 0)
 }
+
+@(test)
+test_loading_of_unloaded_dependencies :: proc(t: ^testing.T) {
+
+}
+
+@(test)
+test_loading_of_loaded_dependencies :: proc(t: ^testing.T) {
+
+}
+
+@(test)
+test_loading_of_cyclic_dependencies :: proc(t: ^testing.T) {
+
+}

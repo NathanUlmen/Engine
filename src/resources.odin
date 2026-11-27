@@ -505,6 +505,16 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 			return {}, .Missing_Serializer
 		}
 
+		dependent_handles := make([dynamic]Rs_Handle(any), len(artifact.dependencies), rs.sys_allocator)
+		defer {
+			for &handle in dependent_handles {
+				handle_release(rs, &handle)
+			}
+			delete(dependent_handles)
+		}
+		load_dependencies(rs, &dependent_handles, artifact)
+
+
 		resource, create_ok := serializer.create_resource(serializer.user_data, artifact.baked_file_path, rs, rs.sys_allocator)
 		assert(create_ok)
 		assert(resource.data_size_bytes > 0, "Data should not have a size of 0!")
@@ -555,19 +565,11 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: ^Resource_
 	}
 	sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 
-	new_slot_handle, err := add_new_slot(rs, id, {}, T, .SCHEDULED)
-	//TODO: handlde error better.
-	assert(err == .None)
+	//TODO: Handle case where .IN_PROGRESS
 
-	sync.rw_mutex_shared_lock(get_lock_seg(rs, handle))
-	reserved_slot := hm.get(&rs.handle_map, new_slot_handle)
-	sync.rw_mutex_shared_unlock(get_lock_seg(rs, handle))
-
-	//2. Start loading of our resrouce
 	sync.rw_mutex_shared_lock(&rs.artficats_lock)
 	artifact, cont := rs.id_to_artifact[id]
 	sync.rw_mutex_shared_unlock(&rs.artficats_lock)
-
 	if !cont {
 		return {.ERROR}
 	}
@@ -579,6 +581,14 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: ^Resource_
 		return Resource_Future{.ERROR}
 	}
 
+	new_slot_handle, err := add_new_slot(rs, id, {}, T, .SCHEDULED)
+	//TODO: handlde error better.
+	assert(err == .None)
+
+	sync.rw_mutex_shared_lock(get_lock_seg(rs, handle))
+	reserved_slot := hm.get(&rs.handle_map, new_slot_handle)
+	sync.rw_mutex_shared_unlock(get_lock_seg(rs, handle))
+
 	Callback_Context :: struct {
 		artifact:          Resource_Artifact,
 		marshaller:        Resource_Marshaller, //for us
@@ -589,7 +599,6 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: ^Resource_
 		dispatcher:        Dispatcher,
 	}
 
-
 	cb_context := new(Callback_Context)
 	callback.handle.handle = new_slot_handle.handle
 	cb_context^ = {artifact, marshaller, rs, reserved_slot, artifact.category_id, callback, cb_dispatcher}
@@ -599,11 +608,22 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: ^Resource_
 		defer log.destroy_console_logger(context.logger)
 		cb_context := cast(^Callback_Context)task.data
 
+		//load the load_dependencies so that they are ready during resource creation.
+		//this could be parallelized but we will get to that later.
+		handles_to_dependencies := make([dynamic]Rs_Handle(any), cb_context.rs.sys_allocator)
+		defer {
+			for &dependency in handles_to_dependencies {
+				handle_release(cb_context.rs, &dependency)
+			}
+			delete(handles_to_dependencies)
+		}
+		load_dependencies(cb_context.rs, &handles_to_dependencies, cb_context.artifact)
+
 		sync.rw_mutex_lock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 		cb_context.slot.status = .IN_PROGRESS
 		sync.rw_mutex_unlock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 
-		resource, ok := cb_context.marshaller.create_resource(cb_context.marshaller.user_data, cb_context.file_path, cb_context.rs, cb_context.rs.sys_allocator)
+		resource, ok := cb_context.marshaller.create_resource(cb_context.marshaller.user_data, cb_context.artifact.baked_file_path, cb_context.rs, cb_context.rs.sys_allocator)
 		//TODO: better error handling for when create_resource fails.
 		assert(resource.data != nil && ok)
 
@@ -628,6 +648,19 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: ^Resource_
 	thread.pool_add_task(rs.pool, rs.sys_allocator, load, cb_context)
 	thread.pool_start(rs.pool)
 	return {.IN_PROGRESS}
+}
+
+@(private)
+load_dependencies :: proc(rs: ^Resource_Store, handles: ^[dynamic]Rs_Handle(any), artifact: Resource_Artifact) {
+	for dependency in artifact.dependencies {
+		handle, err := resource_load(rs, dependency, any)
+		assert(err == .None)
+		append(handles, handle)
+		sync.rw_mutex_shared_lock(&rs.artficats_lock)
+		artifact := rs.id_to_artifact[dependency]
+		sync.rw_mutex_shared_unlock(&rs.artficats_lock)
+		load_dependencies(rs, handles, artifact)
+	}
 }
 
 /*
