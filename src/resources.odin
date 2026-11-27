@@ -507,8 +507,8 @@ resource_load :: proc(rs: ^Resource_Store, id: Rs_Id, $T: typeid) -> (Rs_Handle(
 
 		dependent_handles := make([dynamic]Rs_Handle(any), len(artifact.dependencies), rs.sys_allocator)
 		defer {
-			for &handle in dependent_handles {
-				handle_release(rs, &handle)
+			for &d_handle in dependent_handles {
+				handle_release(rs, &d_handle)
 			}
 			delete(dependent_handles)
 		}
@@ -657,9 +657,9 @@ load_dependencies :: proc(rs: ^Resource_Store, handles: ^[dynamic]Rs_Handle(any)
 		assert(err == .None)
 		append(handles, handle)
 		sync.rw_mutex_shared_lock(&rs.artficats_lock)
-		artifact := rs.id_to_artifact[dependency]
+		dependency_artifact := rs.id_to_artifact[dependency]
 		sync.rw_mutex_shared_unlock(&rs.artficats_lock)
-		load_dependencies(rs, handles, artifact)
+		load_dependencies(rs, handles, dependency_artifact)
 	}
 }
 
@@ -670,7 +670,7 @@ Doesnt complete until all requested resources have loaded successfully.
 */
 batch_load_async :: proc(rs: ^Resource_Store, targets: []Batch_Request, cb_dispatcher: Dispatcher) -> Resource_Future {
 	assert(targets != nil)
-	futures := make([]Resource_Future, len(targets))
+	// futures := make([]Resource_Future, len(targets))
 	// for request, idx in targets {
 	// 	futures[idx] = resource_load_async(rs, request.id, {}, {}, request.type)
 	// }

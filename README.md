@@ -10,7 +10,7 @@ In order to build and run you need Odin installed and setup. For instructions on
 
 To run:
 ```bash
-odin run src/
+make run
 ```
 
 To build:

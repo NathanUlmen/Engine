@@ -1,6 +1,7 @@
 package main
 
 import "core:log"
+import "core:os"
 import "core:time"
 import gl "vendor:OpenGL"
 import sdl "vendor:sdl3"
@@ -100,7 +101,7 @@ loop :: proc(app: ^Application, game: ^Game($T)) {
 				}
 
 			case .QUIT:
-				panic("Exited")
+				os.exit(0)
 			//post to engine to shutdown.
 			}
 		}

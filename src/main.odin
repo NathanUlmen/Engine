@@ -2,6 +2,7 @@ package main
 
 import "core:log"
 import "core:mem"
+import "core:time"
 _ :: mem
 import "core:os"
 
@@ -39,9 +40,18 @@ main :: proc() {
 		}
 
 	}
-
 	log.info(args)
 
+
+	start := time.now()
+	_, ok := glb_read_from_disk(nil, "assets/BoomBox.glb", context.allocator)
+	if !ok {
+		panic("")
+	}
+	total_time := time.diff(start, time.now())
+	log.info("Time to parse", total_time)
+
+	//--- game loop --
 	app: Application
 	game := new(Game(Game_Context))
 	game^ = {{}, nil, nil, update, nil}
