@@ -126,13 +126,12 @@ Resource_Future :: struct {
 	status: Load_Status,
 }
 
-Dispatcher :: struct {
-	post: proc(to_run: Resource_Callback),
-}
-
-Resource_Callback :: struct {
-	user_data: rawptr,
-	cb:        proc(user_data: rawptr, handle: Rs_Handle(any)),
+Resource_Callback :: struct($T: typeid) {
+	user_data:  rawptr,
+	user_index: int,
+	handle:     Rs_Handle(T),
+	allocator:  mem.Allocator,
+	cb:         proc(user_data: ^Resource_Callback(T)),
 }
 
 Marshaller_Context :: struct {
@@ -539,7 +538,7 @@ the callback is posted to the dispatcher immediately.
     - callback: the procedure to execute once the resource has been acquired.
     - dispatcher: responsible for routing/scheduling the execution of the callback.
 */
-resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_Callback, cb_dispatcher: Dispatcher, $T: typeid) -> Resource_Future {
+resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: ^Resource_Callback($T), cb_dispatcher: Dispatcher) -> Resource_Future {
 	sync.rw_mutex_shared_lock(&rs.loaded_lock)
 	handle := rs.id_to_loaded[id]
 	sync.rw_mutex_shared_unlock(&rs.loaded_lock)
@@ -547,19 +546,16 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 	sync.rw_mutex_lock(get_lock_seg(rs, handle))
 	slot, contained := hm.get(&rs.handle_map, handle)
 
-
 	if contained {
 		slot.ref_count += 1
+		callback.handle = {slot.handle}
 		sync.rw_mutex_unlock(get_lock_seg(rs, handle))
-		//TODO: post callback to dispatcher
+		post_callback(callback, cb_dispatcher)
 		return Resource_Future{.LOADED}
 	}
 	sync.rw_mutex_unlock(get_lock_seg(rs, handle))
 
-	//Case: Resrouce not loaded.
-	//1. Reserve/check out a slot for our data.
 	new_slot_handle, err := add_new_slot(rs, id, {}, T, .SCHEDULED)
-
 	//TODO: handlde error better.
 	assert(err == .None)
 
@@ -584,17 +580,19 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 	}
 
 	Callback_Context :: struct {
-		file_path:         string,
-		marshaller:        Resource_Marshaller,
-		rs:                ^Resource_Store,
-		slot:              ^Resource_Slot,
-		category:          Rs_Category_Id,
-		resource_callback: Resource_Callback,
+		artifact:          Resource_Artifact,
+		marshaller:        Resource_Marshaller, //for us
+		rs:                ^Resource_Store, //for us
+		slot:              ^Resource_Slot, //for us
+		category:          Rs_Category_Id, //for us
+		resource_callback: ^Resource_Callback(T), // for them
 		dispatcher:        Dispatcher,
 	}
 
+
 	cb_context := new(Callback_Context)
-	cb_context^ = {artifact.baked_file_path, marshaller, rs, reserved_slot, artifact.category_id, callback, cb_dispatcher}
+	callback.handle.handle = new_slot_handle.handle
+	cb_context^ = {artifact, marshaller, rs, reserved_slot, artifact.category_id, callback, cb_dispatcher}
 
 	load :: proc(task: thread.Task) {
 		context.logger = log.create_console_logger()
@@ -623,9 +621,7 @@ resource_load_async :: proc(rs: ^Resource_Store, id: Rs_Id, callback: Resource_C
 		cb_context.slot.status = .LOADED
 		sync.rw_mutex_unlock(get_lock_seg(cb_context.rs, cb_context.slot.handle))
 
-		//TODO: Dispatcher callback
-		cb_context.dispatcher.post(cb_context.resource_callback)
-		// cb_context.resource_callback.cb(cb_context.resource_callback.user_data, Rs_Handle(any){cb_context.slot.handle})
+		post_callback(cb_context.resource_callback, cb_context.dispatcher)
 		free(cb_context)
 	}
 
@@ -639,7 +635,7 @@ Loads a group of requested resources asynchronously in the same manner as resour
 Doesnt complete until all requested resources have loaded successfully. 
 
 */
-batch_load_async :: proc(rs: ^Resource_Store, targets: []Batch_Request, callback: Resource_Callback, cb_dispatcher: Dispatcher) -> Resource_Future {
+batch_load_async :: proc(rs: ^Resource_Store, targets: []Batch_Request, cb_dispatcher: Dispatcher) -> Resource_Future {
 	assert(targets != nil)
 	futures := make([]Resource_Future, len(targets))
 	// for request, idx in targets {
@@ -648,6 +644,21 @@ batch_load_async :: proc(rs: ^Resource_Store, targets: []Batch_Request, callback
 	//join on futures. Once completed post the callback to the dispatcher
 
 	return {}
+}
+
+//Should we make this take a handle to prevent bugs where we forget to set the callbacks handle
+@(private)
+post_callback :: proc(resource_callback: ^Resource_Callback($T), dispatcher: Dispatcher) {
+	to_task :: proc(callback: ^Resource_Callback($T)) -> thread.Task {
+		converted_proc :: proc(task: thread.Task) {
+			cb := cast(^Resource_Callback(T))task.data
+			cb.cb(cb)
+		}
+		return thread.Task{procedure = converted_proc, data = callback, user_index = callback.user_index, allocator = callback.allocator}
+	}
+
+	task: thread.Task = to_task(resource_callback)
+	dispatcher->post(task)
 }
 
 

@@ -11,6 +11,7 @@ import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 
 DEFAULT_CATEGORY :: src.Rs_Category_Id(0)
 
@@ -241,6 +242,7 @@ test_async_loading :: proc(t: ^testing.T) {
 	context.random_generator = crypto.random_generator()
 	rs := init_rs_store_with_data()
 	cb_data := new(int)
+	cb_data^ = 0
 	defer {
 		cleanup_rs_store(rs)
 		free(cb_data)
@@ -251,23 +253,31 @@ test_async_loading :: proc(t: ^testing.T) {
 		t:     ^testing.T,
 	}
 
-
-	handle :: proc(data: rawptr, foo: src.Rs_Handle(any)) {
-		v := cast(^Data)data
+	initial_cb :: proc(data: ^src.Resource_Callback(string)) {
+		v := cast(^Data)data.user_data
+		context.logger = log.create_console_logger()
+		defer log.destroy_console_logger(context.logger)
+		testing.expectf(v.t, data.handle.handle != hm.Handle64{}, "Expected handle to not equal %v", hm.Handle64{})
 		sync.atomic_add(v.count, 1)
 	}
 
-
-	runner :: proc(cb: src.Resource_Callback) {
-		cb.cb(cb.user_data, {})
+	/*
+    for testing purposes we just run it immediately. In real usage you would probably
+    defer it to run somewhere else later on in the program.
+    */
+	runner :: proc(_: src.Dispatcher, cb: thread.Task) {
+		cb.procedure(cb)
 	}
 
-
-	blah := new(Data)
-	defer free(blah)
-	blah^ = {cb_data, t}
+	callback_data := new(Data)
+	defer free(callback_data)
+	callback_data^ = {cb_data, t}
 	for id, _ in rs.id_to_artifact {
-		src.resource_load_async(rs, id, {user_data = blah, cb = handle}, {runner}, string)
+		callback := src.Resource_Callback(string) {
+			user_data = callback_data,
+			cb        = initial_cb,
+		}
+		src.resource_load_async(rs, id, &callback, {{}, runner})
 	}
 
 	//loop till all are loaded
@@ -286,10 +296,14 @@ test_async_loading :: proc(t: ^testing.T) {
 	}
 
 	log.info("async count: ", cb_data^)
-	testing.expect(t, cb_data^ == len(rs.id_to_artifact))
+	testing.expectf(t, cb_data^ == len(rs.id_to_artifact), "Expected callback count to be %v, recieved %v", len(rs.id_to_artifact), cb_data^)
 
 	for id, _ in rs.id_to_artifact {
-		src.resource_load_async(rs, id, {blah, handle}, {runner}, string)
+		callback := src.Resource_Callback(string) {
+			user_data = callback_data,
+			cb        = initial_cb,
+		}
+		src.resource_load_async(rs, id, &callback, {{}, runner})
 		testing.expect(t, ref_count(rs, id) == 2)
 	}
 	category, has := rs.categories[DEFAULT_CATEGORY]
@@ -379,8 +393,8 @@ test_category_resize :: proc(t: ^testing.T) {
 	rs := init_rs_store_with_data()
 	defer cleanup_rs_store(rs)
 
-	// src.category_resize(rs, DEFAULT_CATEGORY, 2000)
-	// testing.expect(t, rs.categories[DEFAULT_CATEGORY].budget_bytes == 2000)
+	src.category_resize(rs, DEFAULT_CATEGORY, 2000)
+	testing.expect(t, rs.categories[DEFAULT_CATEGORY].budget_bytes == 2000)
 }
 
 @(test)
@@ -395,10 +409,7 @@ test_error_on_missing_file :: proc(t: ^testing.T) {
 	testing.expect(t, err == .Missing_File)
 }
 
-@(test)
-test_fails_when_resource_size_zero :: proc(t: ^testing.T) {
-
-}
+test_fails_when_resource_size_zero :: proc(t: ^testing.T) {}
 
 @(test)
 test_category_byte_counts_accurate :: proc(t: ^testing.T) {
